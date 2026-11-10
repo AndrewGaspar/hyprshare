@@ -26,6 +26,12 @@ original a different window. XDPH sees a size change and renegotiates its PipeWi
 - **Picked window closes while redirected** → the share keeps showing the target. (XDPH keeps
   capturing the closed foreign-toplevel handle, which then resolves to no window at all; the
   plugin recognises that client's dead, redirected capture and keeps serving the target.)
+- **Nothing live left to serve** (the shared window closed with no redirect, or the picked window
+  is gone and the target closed too) → the plugin *holds* the frame: it creates the frame object
+  the compositor would otherwise silently drop, and sends nothing on it. The consumer keeps its
+  last frame, the capture stays active, and the next `sharewindow` sends that frame one `failed`;
+  the portal (patched XDPH) re-requests at once and the share resumes on the new target. Without
+  this, the portal waits forever for a frame that never comes and the share can't be moved.
 - The window actually being served to an active capture carries the tag **`screenshared`**; it
   moves with redirects and is removed ~1 s after the window stops being served, on clear, and on
   unload.
@@ -45,7 +51,7 @@ from** — not `/usr/include/hyprland`, which belongs to stock hyprland with dif
 GIT_TAG=v0.56.2-468-g9648898995 GIT_COMMITS=8129 GIT_COMMIT_DATE=2026-11-05 scripts/prepare-headers.sh
 
 # 2. Plugin and the test probe
-make              # -> build/hyprshare.so
+make              # -> build/hyprshare-v2.so (versioned: never overwrite a .so a session has loaded)
 make -C tests     # -> tests/build/capture-probe
 make hash         # shows the tree's commit next to the running compositor's
 ```
@@ -60,13 +66,20 @@ client hash in `pluginInit`, before hooking anything).
 ## Load / unload (live session)
 
 ```sh
-hyprctl plugin load   /home/ajg/code/hyprshare/build/hyprshare.so
-hyprctl plugin unload /home/ajg/code/hyprshare/build/hyprshare.so
+hyprctl plugin load   /home/ajg/code/hyprshare/build/hyprshare-v2.so
+hyprctl plugin unload /home/ajg/code/hyprshare/build/hyprshare-v2.so
 hyprctl plugin list
 ```
 
 Unloading removes the hook, the hyprctl commands, the Lua functions, the frame listeners, the timer
-and the `screenshared` tags; running shares just go back to the picked windows.
+and the `screenshared` tags; held frames get `failed`; running shares go back to the picked windows.
+
+Hyprland `dlopen`s by path, so a new build gets a new file name. Upgrading from the first build:
+
+```sh
+hyprctl plugin unload /home/ajg/code/hyprshare/build/hyprshare.so
+hyprctl plugin load   /home/ajg/code/hyprshare/build/hyprshare-v2.so
+```
 
 ## Use
 
@@ -151,15 +164,19 @@ and PID-tracked cleanup.
 `tests/capture-probe` stands in for XDPH: a fresh capture request per frame, printing the
 advertised buffer size; `--app-id` uses XDPH's exact request
 (`capture_toplevel_with_wlr_toplevel_handle`, keeping the handle after the toplevel closes),
-`--handle` the uint variant, `--hold` keeps a frame pending, `--copy` really copies into shm.
+`--handle` the uint variant, `--hold` keeps a frame pending, `--copy` really copies into shm,
+`--xdph` waits for frame events forever and re-requests after `failed` (patched XDPH).
 
-Covered (44 checks): load + hash check against the live binary; per-frame sizes before/after
+Covered (64 checks): load + hash check against the live binary; per-frame sizes before/after
 `sharewindow`; two sessions on one origin following; uint-handle path; real pixel copies into a
 B-sized buffer after the redirect; tag + border rule moving and expiring; `sharestatus` fields
 (also a layout sanity check: class and pid read through the plugin's view of the structs); Lua
 functions via `hyprctl eval`, error returns, surviving `hyprctl reload`; `shareclear`; target
 closing (fallback); picked window closing (keeps serving the target, both handle paths); a held
-frame keeping a capture active; unload (tags gone, commands gone, hook really out).
+frame keeping a capture active; the shared window closing with nothing redirected (held, no
+`failed`, capture active → `sharewindow` releases it with exactly one `failed` → resumes on the
+target); picked window dead + target closed (held → `sharewindow` → resumes); a held frame at unload
+getting `failed`; unload (tags gone, commands gone, hook really out).
 
 ## Known limitations (spike)
 
@@ -168,8 +185,8 @@ frame keeping a capture active; unload (tags gone, commands gone, hook really ou
 - **One global target.** All redirected shares show the same window; no per-share targeting.
 - **Only shares active at `sharewindow` time** are redirected; a share started later needs another
   `sharewindow`.
-- **Picked + target both closed** → the stream stalls exactly as it would without the plugin
-  (the compositor rejects captures of a dead window and sends nothing).
+- **Nothing live to serve** → the stream freezes on its last frame (held) until the next
+  `sharewindow`; unpatched XDPH has no `failed` recovery, so resuming needs the patched portal.
 - **Screencast indicators may flicker or lie.** Each (client, window) is its own compositor
   screenshare session: on a swap the target's session starts (`screencast>>1,…` IPC event) and
   the picked window's session stops ~500 ms later (`screencast>>0,…`). Anything counting those

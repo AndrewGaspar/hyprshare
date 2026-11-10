@@ -23,7 +23,7 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(dirname "$HERE")"
-PLUGIN="$(realpath "${1:-$ROOT/build/hyprshare.so}")"
+PLUGIN="$(realpath "${1:-$ROOT/build/hyprshare-v2.so}")"
 HYPRLAND_BIN="${HYPRLAND_BIN:-/usr/lib/hypxrland/Hyprland}"
 HYPRCTL_BIN="${HYPRCTL_BIN:-/usr/lib/hypxrland/hyprctl}"
 PROBE="$HERE/build/capture-probe"
@@ -247,12 +247,71 @@ sleep 2
 expect_eq "held frame: capture still active after 2s" "true" "$(status | jq -r --argjson pid "$PID_hold" '[.captures[] | select(.pid == $pid)][0] | "\(.active)"')"
 expect_eq "held frame: outstandingFrames" "1" "$(status | jq -r --argjson pid "$PID_hold" '[.captures[] | select(.pid == $pid)][0].outstandingFrames')"
 
+# --- the served window closes with nothing redirected -> held, and sharewindow can still move it ---
+# Without holding, the compositor drops the request (no frame object at all), the portal waits for
+# it forever, the capture goes inactive and sharewindow has nothing left to redirect.
+kill "$PID_p2" "$PID_p3" "$PID_hold" 2>/dev/null
+failed_count() { grep -c ' failed$' "$T/logs/$1.out"; }
+capture_field() { # probe-name jq-field
+    local pid
+    pid="$(eval echo "\$PID_$1")"
+    status | jq -r --argjson pid "$pid" "[.captures[] | select(.pid == \$pid)][0].$2"
+}
+# kitty sets its class a moment after mapping, so the float/size rules land late: give them time.
+wait_mapped() { for _ in $(seq 100); do [[ -n "$(addr_of "$1")" ]] && break; sleep 0.1; done; sleep 1; }
+
+spawn_window hsD
+spawn_window hsE
+wait_mapped hsD
+wait_mapped hsE
+SIZE_D="$(size_of hsD)"; SIZE_E="$(size_of hsE)"
+echo "D=$(addr_of hsD) ($SIZE_D)  E=$(addr_of hsE) ($SIZE_E)  C=$C ($SIZE_C)"
+expect_eq "shareclear before the held scenarios" "ok" "$(ctl shareclear)"
+start_probe x1 --xdph --app-id hsD --interval-ms 50
+sleep 1
+expect_eq "x1 (XDPH-like) captures D" "$SIZE_D" "$(last_size x1)"
+
+kill "$PID_hsD"
+sleep 2
+expect_eq "D closed, nothing redirected: x1 gets no failed (keeps its last frame)" "0" "$(failed_count x1)"
+expect_eq "D closed: x1 still shows D's last frame" "$SIZE_D" "$(last_size x1)"
+expect_eq "D closed: capture stays active" "true" "$(capture_field x1 active)"
+expect_eq "D closed: one held frame" "1" "$(capture_field x1 heldFrames)"
+expect_eq "sharewindow moves the held share to E" "ok" "$(ctl sharewindow class:hsE)"
+sleep 0.6
+expect_eq "held frame released with exactly one failed" "1" "$(failed_count x1)"
+expect_eq "x1 re-requested and now captures E" "$SIZE_E" "$(last_size x1)"
+expect_eq "no held frames left" "0" "$(capture_field x1 heldFrames)"
+expect_eq "E tagged" "screenshared" "$(tags_of hsE)"
+
+# --- origin dead AND the target closes -> held -> sharewindow C resumes it ---
+kill "$PID_hsE"
+sleep 2
+expect_eq "D dead + E closed: still exactly one failed" "1" "$(failed_count x1)"
+expect_eq "D dead + E closed: held" "1" "$(capture_field x1 heldFrames)"
+expect_eq "D dead + E closed: capture stays active" "true" "$(capture_field x1 active)"
+expect_eq "sharewindow C" "ok" "$(ctl sharewindow class:hsC)"
+sleep 0.6
+expect_eq "released again: second failed" "2" "$(failed_count x1)"
+expect_eq "x1 resumes on C" "$(size_of hsC)" "$(last_size x1)"
+
+# --- a held frame at unload gets failed too ---
+spawn_window hsF
+wait_mapped hsF
+start_probe x2 --xdph --app-id hsF --interval-ms 50
+sleep 1
+expect_eq "x2 captures F" "$(size_of hsF)" "$(last_size x2)"
+kill "$PID_hsF"
+sleep 1.5
+expect_eq "F closed (x2's own capture, not redirected): held" "1" "$(capture_field x2 heldFrames)"
+
 status >"$T/logs/status.json"
 
 # --- unload -----------------------------------------------------------------------------------
 expect_eq "plugin unload" "ok" "$(ctl plugin unload "$PLUGIN" | tail -1)"
 sleep 0.5
 expect_eq "tag removed on unload" "" "$(tags_of hsC)"
+expect_eq "held frame got failed on unload" "failed" "$(tail -1 "$T/logs/x2.out" | awk '{print $3}')"
 expect_eq "sharestatus gone after unload" "unknown request" "$(ctl sharestatus)"
 sleep 0.5
 expect_eq "compositor alive after unload" "0" "$(kill -0 "$COMPOSITOR_PID" 2>/dev/null; echo $?)"

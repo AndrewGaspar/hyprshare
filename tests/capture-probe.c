@@ -16,6 +16,9 @@
 //                     handle whose app_id matches — the exact request XDPH uses. The handle is kept
 //                     after the toplevel closes, as XDPH does.
 //
+// --xdph waits for buffer_done/failed forever instead of giving up after 1s, like the portal; on
+// `failed` it destroys the spent frame and re-requests (patched XDPH's failed-frame handling).
+//
 // Other options: --count <n> (0 = forever, default), --interval-ms <ms> (default 100), --copy.
 
 #define _GNU_SOURCE
@@ -227,7 +230,7 @@ static const char* copyFrame(struct wl_display* display, struct hyprland_topleve
 }
 
 static int usage(const char* argv0) {
-    fprintf(stderr, "usage: %s (--handle <n> | --app-id <id>) [--count <n>] [--interval-ms <ms>] [--hold | --copy]\n", argv0);
+    fprintf(stderr, "usage: %s (--handle <n> | --app-id <id>) [--count <n>] [--interval-ms <ms>] [--hold | --copy] [--xdph]\n", argv0);
     return 2;
 }
 
@@ -238,6 +241,7 @@ int main(int argc, char** argv) {
     long        intervalMs = 100;
     bool        hold       = false;
     bool        copy       = false;
+    bool        xdph       = false;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--handle") == 0 && i + 1 < argc)
@@ -252,6 +256,8 @@ int main(int argc, char** argv) {
             hold = true;
         else if (strcmp(argv[i], "--copy") == 0)
             copy = true;
+        else if (strcmp(argv[i], "--xdph") == 0)
+            xdph = true;
         else
             return usage(argv[0]);
     }
@@ -310,7 +316,7 @@ int main(int argc, char** argv) {
 
         // Wait up to 1s for buffer_done/failed. A compositor that rejects the request outright (dead
         // window) sends nothing at all, which is what XDPH would see too.
-        waitFor(display, &g_frameDone, 1000);
+        waitFor(display, &g_frameDone, xdph ? 1000 * 1000 * 1000 : 1000);
 
         if (!g_frameDone)
             printf("frame %ld none\n", n);

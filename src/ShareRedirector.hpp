@@ -25,6 +25,7 @@
 #include <vector>
 
 class CEventLoopTimer;
+class CHyprlandToplevelExportFrameV1;
 
 namespace HyprShare {
     // The tag maintained on the window(s) currently served to an active window capture.
@@ -39,14 +40,19 @@ namespace HyprShare {
         CShareRedirector& operator=(const CShareRedirector&) = delete;
 
         struct SServeDecision {
-            PHLWINDOW window;        // what the compositor should actually capture (may be null)
-            uint64_t  captureID = 0; // 0 = not tracked (nothing to watch)
+            PHLWINDOW window;            // what the compositor should actually capture (may be null)
+            uint64_t  captureID = 0;     // 0 = not tracked (nothing to watch)
+            bool      hold      = false; // tracked, but nothing live to serve: hold the frame instead
         };
 
         // Called from the captureToplevel hook BEFORE the original runs.
         SServeDecision onCaptureRequest(wl_client* client, PHLWINDOW requested);
         // Called from the hook AFTER the original created (or failed to create) frame object `frameID`.
-        void            watchFrame(wl_client* client, uint32_t frameID, uint64_t captureID);
+        void watchFrame(wl_client* client, uint32_t frameID, uint64_t captureID);
+        // Instead of the original: create frame object `frameID` ourselves and send nothing on it, so
+        // the consumer keeps its last frame and the capture stays active until something live can be
+        // served again (then it gets `failed`, and the portal re-requests).
+        void            holdFrame(wl_client* client, uint32_t version, uint32_t frameID, uint64_t captureID);
 
         SDispatchResult shareWindow(const std::string& selector);
         SDispatchResult clear();
@@ -74,6 +80,13 @@ namespace HyprShare {
             bool         matches(const SCapture& capture) const;
         };
 
+        // A frame object we created ourselves for a capture with nothing live to serve.
+        struct SHeldFrame {
+            SP<CHyprlandToplevelExportFrameV1> resource;
+            uint64_t                           captureID = 0;
+            bool                               released  = false; // `failed` already sent
+        };
+
         // A destroy listener on one frame wl_resource. Owned here, unlinked on destruction.
         struct SFrameWatch {
             wl_listener       listener  = {};
@@ -86,6 +99,7 @@ namespace HyprShare {
         PHLWINDOWREF                 m_target;
         std::vector<PHLWINDOWREF>    m_tagged;
         std::vector<UP<SFrameWatch>> m_frameWatches;
+        std::vector<UP<SHeldFrame>>  m_heldFrames;
         uint64_t                     m_nextCaptureID = 1;
 
         SP<CEventLoopTimer>          m_timer;
@@ -96,6 +110,10 @@ namespace HyprShare {
         bool                         isRedirected(const SCapture& capture) const;
         PHLWINDOW                    resolve(const SCapture& capture) const;
         PHLWINDOW                    validTarget() const;
+        size_t                       heldFrameCount(uint64_t captureID) const;
+
+        void                         releaseHeldFrames();
+        void                         dropHeldFrame(CHyprlandToplevelExportFrameV1* resource);
 
         void                         onFrameDestroyed(SFrameWatch* watch);
         static void                  onFrameDestroyedThunk(wl_listener* listener, void* data);

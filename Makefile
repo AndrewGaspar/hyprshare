@@ -38,7 +38,8 @@ LDLIBS += $(shell pkg-config --libs lua wayland-server)
 
 SRC = src/main.cpp src/ShareRedirector.cpp
 OBJ = $(SRC:src/%.cpp=build/%.o)
-TARGET = build/hyprshare.so
+# Versioned file name: Hyprland dlopens by path, so never overwrite a .so a live session has loaded.
+TARGET = build/hyprshare-v2.so
 
 all: $(TARGET)
 

@@ -36,6 +36,13 @@ struct SSavedClientTag {
 };
 template struct SPrivateMember<SSavedClientTag, &CToplevelExportClient::m_savedClient>;
 
+// ... and so is its manager resource, whose version a frame we create ourselves must carry.
+struct SManagerResourceTag {
+    using type = SP<CHyprlandToplevelExportManagerV1> CToplevelExportClient::*;
+    friend type                                       privateMember(SManagerResourceTag);
+};
+template struct SPrivateMember<SManagerResourceTag, &CToplevelExportClient::m_resource>;
+
 static void hkCaptureToplevel(CToplevelExportClient* self, uint32_t frame, int32_t overlayCursor, PHLWINDOW handle) {
     const auto       ORIGINAL = rc<FCaptureToplevel>(g_pCaptureToplevelHook->m_original);
 
@@ -46,6 +53,15 @@ static void hkCaptureToplevel(CToplevelExportClient* self, uint32_t frame, int32
     }
 
     const auto DECISION = redirector()->onCaptureRequest(CLIENT, handle);
+
+    if (DECISION.hold) {
+        // The original would log and return without creating the frame object (see holdFrame).
+        const auto& MANAGER = self->*privateMember(SManagerResourceTag{});
+        if (MANAGER && MANAGER->resource()) {
+            redirector()->holdFrame(CLIENT, MANAGER->version(), frame, DECISION.captureID);
+            return;
+        }
+    }
 
     ORIGINAL(self, frame, overlayCursor, DECISION.window);
 
