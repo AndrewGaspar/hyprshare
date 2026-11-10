@@ -5,6 +5,7 @@
 #include <src/desktop/state/FocusState.hpp>
 #include <src/desktop/state/ViewQuery.hpp>
 #include <src/desktop/state/ViewState.hpp>
+#include <src/desktop/state/WindowState.hpp>
 #include <src/desktop/view/Window.hpp>
 #include <src/helpers/Format.hpp>
 #include <src/helpers/cm/ColorManagement.hpp>
@@ -74,6 +75,16 @@ static std::string windowJSON(const PHLWINDOWREF& ref, uintptr_t addressIfDead) 
                        jsonEscape(WINDOW->m_class), jsonEscape(WINDOW->m_title));
 }
 
+// Tag on every window while any share is active, so styling (border rules, ...) can differ in share mode.
+static constexpr const char* MODE_TAG = "screenshare-mode";
+
+static void                  setModeTag(const PHLWINDOW& window, bool on) {
+    if (!window || !window->m_isMapped)
+        return;
+
+    std::ignore = Config::Actions::tag(std::format("{}{}", on ? "+" : "-", MODE_TAG), window);
+}
+
 static void setSharedTag(const PHLWINDOW& window, bool shared) {
     // Same path as the `tagwindow` dispatcher: applies the tag, re-evaluates rules, refreshes decorations.
     if (!window || !window->m_isMapped)
@@ -93,6 +104,10 @@ CShareRedirector::~CShareRedirector() {
         wl_list_remove(&watch->listener.link);
     }
     m_frameWatches.clear();
+    for (auto& watch : m_clientWatches) {
+        wl_list_remove(&watch->listener.link);
+    }
+    m_clientWatches.clear();
 
     // Placeholder frames: answer any still open (so the client doesn't hang), then DISOWN the
     // resources rather than destroy them. These are CLIENT-created objects; destroying one from the
@@ -124,6 +139,9 @@ CShareRedirector::~CShareRedirector() {
 
     for (const auto& ref : m_tagged) {
         setSharedTag(ref.lock(), false);
+    }
+    for (const auto& ref : m_modeTagged) {
+        setModeTag(ref.lock(), false);
     }
 }
 
@@ -201,7 +219,8 @@ PHLWINDOW CShareRedirector::serveWindow(SCapture& capture) {
     // Nothing live to serve. Enter the sticky NOTHING state: from here only an explicit share/clear
     // (never a window reappearing, never a recycled address) leaves it.
     if (!capture.nothing) {
-        capture.nothing = true;
+        capture.nothing      = true;
+        capture.pausedByUser = false;
         Log::logger->log(Log::DEBUG, "[hyprshare] capture {} entered NOTHING (served window gone); serving placeholder", capture.id);
     }
     capture.served = {};
@@ -226,6 +245,7 @@ CShareRedirector::SServeDecision CShareRedirector::onCaptureRequest(wl_client* c
 
         pid_t pid = -1;
         wl_client_get_credentials(client, &pid, nullptr, nullptr); // client is live: we are inside its request
+        watchClient(client);
 
         capture = &m_captures.emplace_back(SCapture{
             .id         = m_nextCaptureID++,
@@ -263,6 +283,32 @@ void CShareRedirector::watchFrame(wl_client* client, uint32_t frameID, uint64_t 
     wl_resource_add_destroy_listener(RESOURCE, &watch->listener);
 
     CAPTURE->outstandingFrames++;
+}
+
+void CShareRedirector::watchClient(wl_client* client) {
+    if (std::ranges::any_of(m_clientWatches, [client](const auto& w) { return w->client == client; }))
+        return;
+
+    auto& watch            = m_clientWatches.emplace_back(makeUnique<SClientWatch>());
+    watch->client          = client;
+    watch->owner           = this;
+    watch->listener.notify = &CShareRedirector::onClientDestroyedThunk;
+    wl_client_add_destroy_listener(client, &watch->listener);
+}
+
+void CShareRedirector::onClientDestroyedThunk(wl_listener* listener, void* data) {
+    SClientWatch* watch = wl_container_of(listener, watch, listener);
+    watch->owner->onClientDestroyed(watch);
+}
+
+void CShareRedirector::onClientDestroyed(SClientWatch* watch) {
+    // Fires before the client's resources are torn down; their frame/placeholder callbacks then find
+    // no capture and do nothing. libwayland's final emit already unlinked the listener.
+    const auto CLIENT = watch->client;
+    std::erase_if(m_captures, [CLIENT](const auto& c) { return c.client == CLIENT; });
+    std::erase_if(m_clientWatches, [watch](const auto& w) { return w.get() == watch; });
+    updateTags();
+    armTimer();
 }
 
 void CShareRedirector::onFrameDestroyedThunk(wl_listener* listener, void* data) {
@@ -483,6 +529,10 @@ void CShareRedirector::prune(Time::steady_tp now) {
     // enter NOTHING on their next request. Just forget the dangling target ref.
     if (!m_target.expired() && !validTarget())
         m_target.reset();
+
+    // A paused window that closed has nothing to resume to; its captures just stay in NOTHING.
+    if (!m_paused.expired() && !m_paused->m_isMapped)
+        m_paused.reset();
 }
 
 void CShareRedirector::updateTags() {
@@ -518,6 +568,84 @@ void CShareRedirector::updateTags() {
         setSharedTag(w, true);
         m_tagged.emplace_back(w);
     }
+
+    syncModeTags(false);
+    refreshGlyphs();
+}
+
+bool CShareRedirector::shareModeActive() const {
+    const auto NOW = Time::steadyNow();
+    return std::ranges::any_of(m_captures, [&](const auto& c) { return isActive(c, NOW); });
+}
+
+eGlyphState CShareRedirector::glyphStateFor(const PHLWINDOW& window) const {
+    if (!window || !shareModeActive())
+        return GLYPH_NONE;
+
+    const auto NOW = Time::steadyNow();
+    if (window == m_paused.lock() && std::ranges::any_of(m_captures, [&](const auto& c) { return isActive(c, NOW) && c.nothing && c.pausedByUser; }))
+        return GLYPH_PAUSED;
+
+    if (std::ranges::any_of(m_captures, [&](const auto& c) { return isActive(c, NOW) && !c.nothing && c.served.lock() == window; }))
+        return GLYPH_LIVE;
+
+    return GLYPH_IDLE;
+}
+
+void CShareRedirector::syncModeTags(bool force) {
+    // Cheap path: the full window sweep only runs when share mode flips (or on the tick / an open).
+    const bool ACTIVE = shareModeActive();
+    if (ACTIVE == m_modeActive && !force)
+        return;
+    m_modeActive = ACTIVE;
+
+    if (!ACTIVE) {
+        for (const auto& ref : m_modeTagged) {
+            setModeTag(ref.lock(), false);
+        }
+        m_modeTagged.clear();
+        return;
+    }
+
+    std::erase_if(m_modeTagged, [](const auto& ref) { return ref.expired(); });
+    for (const auto& w : Desktop::windowState()->windows()) {
+        if (!w->m_isMapped || std::ranges::any_of(m_modeTagged, [&](const auto& ref) { return ref.lock() == w; }))
+            continue;
+        setModeTag(w, true);
+        m_modeTagged.emplace_back(w);
+    }
+}
+
+void CShareRedirector::onWindowOpened(const PHLWINDOW& window) {
+    if (!m_modeActive || !window || std::ranges::any_of(m_modeTagged, [&](const auto& ref) { return ref.lock() == window; }))
+        return;
+    setModeTag(window, true);
+    m_modeTagged.emplace_back(window);
+}
+
+void CShareRedirector::refreshGlyphs() {
+    if (!glyphs())
+        return;
+
+    // Fingerprint of everything a glyph's look depends on; damage all glyphs when it changes so they
+    // update without waiting for unrelated damage.
+    std::string fp = shareModeActive() ? "A" : "-";
+    fp += std::format("|p{:x}", rc<uintptr_t>(m_paused.get()));
+    std::vector<uintptr_t> served;
+    const auto             NOW = Time::steadyNow();
+    for (const auto& c : m_captures) {
+        if (isActive(c, NOW))
+            served.emplace_back(c.nothing ? (c.pausedByUser ? 1 : 2) : rc<uintptr_t>(c.served.get()));
+    }
+    std::ranges::sort(served);
+    for (const auto S : served) {
+        fp += std::format("|{:x}", S);
+    }
+
+    if (fp == m_glyphFingerprint)
+        return;
+    m_glyphFingerprint = fp;
+    glyphs()->damageAll();
 }
 
 void CShareRedirector::onShareChanged() {
@@ -534,6 +662,13 @@ SDispatchResult CShareRedirector::shareWindow(const std::string& selector) {
     if (!TARGET || !TARGET->m_isMapped)
         return {.success = false, .error = selector.empty() ? "sharewindow: no focused window" : std::format("sharewindow: no window matches \"{}\"", selector)};
 
+    return shareWindowTarget(TARGET);
+}
+
+SDispatchResult CShareRedirector::shareWindowTarget(const PHLWINDOW& TARGET) {
+    if (!TARGET || !TARGET->m_isMapped)
+        return {.success = false, .error = "sharewindow: target window is gone"};
+
     const auto NOW = Time::steadyNow();
 
     // Every active capture follows the new target — including ones currently in NOTHING (that is the
@@ -544,8 +679,9 @@ SDispatchResult CShareRedirector::shareWindow(const std::string& selector) {
         if (!isActive(c, NOW))
             continue;
 
-        c.mode    = SCapture::FOLLOW_TARGET;
-        c.nothing = false;
+        c.mode         = SCapture::FOLLOW_TARGET;
+        c.nothing      = false;
+        c.pausedByUser = false;
         affected++;
     }
 
@@ -553,6 +689,7 @@ SDispatchResult CShareRedirector::shareWindow(const std::string& selector) {
         return {.success = false, .error = "sharewindow: no active window share to redirect"};
 
     m_target = TARGET;
+    m_paused.reset();
     onShareChanged();
 
     Log::logger->log(Log::DEBUG, "[hyprshare] serving {} ({}) to {} share(s)", addressString(addressOf(TARGET)), TARGET->m_class, affected);
@@ -563,13 +700,49 @@ SDispatchResult CShareRedirector::clear() {
     // Back to each portal's own pick (the user's mental model of "clear"). A capture whose pick is
     // gone simply re-enters NOTHING on its next request.
     for (auto& c : m_captures) {
-        c.mode    = SCapture::FOLLOW_ORIGIN;
-        c.nothing = false;
+        c.mode         = SCapture::FOLLOW_ORIGIN;
+        c.nothing      = false;
+        c.pausedByUser = false;
     }
     m_target.reset();
+    m_paused.reset();
     onShareChanged();
 
     Log::logger->log(Log::DEBUG, "[hyprshare] redirects cleared");
+    return {};
+}
+
+SDispatchResult CShareRedirector::pause() {
+    const auto NOW = Time::steadyNow();
+
+    // Remember what was showing (first live window) so its glyph can resume it.
+    PHLWINDOW was;
+    size_t    affected = 0;
+    for (auto& c : m_captures) {
+        if (!isActive(c, NOW))
+            continue;
+        affected++;
+        if (c.nothing)
+            continue; // already showing the placeholder; keep its reason
+        if (!was)
+            was = c.served.lock();
+        c.nothing      = true;
+        c.pausedByUser = true;
+        c.served       = {};
+    }
+
+    if (affected == 0)
+        return {.success = false, .error = "sharepause: no active window share"};
+
+    if (was)
+        m_paused = was;
+
+    // Exactly the closed-window state from here: placeholder frames, no `screenshared` tag on anyone,
+    // no auto-resume. The compositor may still complete a real frame it already had in flight.
+    updateTags();
+    armTimer();
+
+    Log::logger->log(Log::DEBUG, "[hyprshare] paused {} share(s){}", affected, was ? std::format(" (was {})", addressString(addressOf(was))) : "");
     return {};
 }
 
@@ -581,15 +754,18 @@ std::string CShareRedirector::statusJSON() const {
         if (!captures.empty())
             captures += ",\n";
 
-        const char* STATE = c.nothing ? "nothing" : (c.mode == SCapture::FOLLOW_TARGET ? "target" : "origin");
-        const auto  AGO   = std::chrono::duration_cast<std::chrono::milliseconds>(NOW - c.lastSeen).count();
-        captures +=
-            std::format(R"(    {{"pid": {}, "active": {}, "state": "{}", "lastSeenMsAgo": {}, "outstandingFrames": {}, "placeholderFrames": {}, "origin": {}, "served": {}}})",
-                        c.pid, isActive(c, NOW), STATE, AGO, c.outstandingFrames, placeholderCount(c.id), windowJSON(c.origin, c.originAddr), windowJSON(c.served, 0));
+        const char* STATE  = c.nothing ? "nothing" : (c.mode == SCapture::FOLLOW_TARGET ? "target" : "origin");
+        const char* REASON = !c.nothing ? "" : (c.pausedByUser ? "paused" : "closed");
+        const auto  AGO    = std::chrono::duration_cast<std::chrono::milliseconds>(NOW - c.lastSeen).count();
+        captures += std::format(
+            R"(    {{"pid": {}, "active": {}, "state": "{}", "nothingReason": "{}", "lastSeenMsAgo": {}, "outstandingFrames": {}, "placeholderFrames": {}, "origin": {}, "served": {}}})",
+            c.pid, isActive(c, NOW), STATE, REASON, AGO, c.outstandingFrames, placeholderCount(c.id), windowJSON(c.origin, c.originAddr), windowJSON(c.served, 0));
     }
 
     const auto TARGET = m_target.lock();
-    return std::format("{{\n  \"target\": {},\n  \"captures\": [\n{}\n  ]\n}}\n", TARGET ? windowJSON(m_target, 0) : "null", captures);
+    const auto PAUSED = m_paused.lock();
+    return std::format("{{\n  \"shareMode\": {},\n  \"target\": {},\n  \"paused\": {},\n  \"captures\": [\n{}\n  ],\n  \"glyph\": {}\n}}\n", shareModeActive(),
+                       TARGET ? windowJSON(m_target, 0) : "null", PAUSED ? windowJSON(m_paused, 0) : "null", captures, glyphs() ? glyphs()->statusJSON() : "null");
 }
 
 UP<CShareRedirector>& HyprShare::redirector() {

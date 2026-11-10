@@ -6,6 +6,10 @@
 # ("Preparing the headers tree") or scripts/prepare-headers.sh.
 
 HYPRLAND_SRC ?= $(HOME)/.cache/hypxrland-worktrees/hyprshare-headers
+# Alternative (for packaging): a directory holding a hypxrland hyprland.pc, e.g.
+#   make HYPRLAND_PC_DIR=/usr/lib/hypxrland/pkgconfig
+# takes include paths from it instead of the source tree. (Untested until that package exists.)
+HYPRLAND_PC_DIR ?=
 # glaze is header-only and only reachable through some Hyprland headers; same pin as the package.
 GLAZE_INCLUDE ?= $(HOME)/.cache/hyprshare-tools/glaze-b518eec7/include
 
@@ -29,24 +33,35 @@ PKGS = pixman-1 libdrm pangocairo libinput libudev wayland-server xkbcommon aqua
 
 CXXFLAGS ?= -O2 -g
 CXXFLAGS += -std=gnu++26 -fPIC -fno-lto -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Wno-narrowing -Wno-pointer-arith
+ifneq ($(strip $(HYPRLAND_PC_DIR)),)
+HYPRLAND_INCLUDES = $(shell PKG_CONFIG_PATH=$(HYPRLAND_PC_DIR) pkg-config --cflags hyprland)
+TREE_CHECK        =
+else
+HYPRLAND_INCLUDES = -I$(HYPRLAND_SRC) -I$(HYPRLAND_SRC)/src -I$(HYPRLAND_SRC)/protocols
+TREE_CHECK        = check-tree
+endif
+
 CPPFLAGS += $(HYPRLAND_DEFINES) \
-	-I$(HYPRLAND_SRC) -I$(HYPRLAND_SRC)/src -I$(HYPRLAND_SRC)/protocols \
-	-isystem $(GLAZE_INCLUDE) \
+	$(HYPRLAND_INCLUDES) \
+	$(if $(wildcard $(GLAZE_INCLUDE)),-isystem $(GLAZE_INCLUDE)) \
 	$(shell pkg-config --cflags $(PKGS))
-LDFLAGS += -shared
+# -z nodelete: the compositor keeps pointers into this .so after unload (config value names,
+# decorations a hidden window only destroys once shown again, pass-element vtables). Keeping the
+# image mapped makes those inert instead of dangling.
+LDFLAGS += -shared -Wl,-z,nodelete
 LDLIBS += $(shell pkg-config --libs lua wayland-server)
 
-SRC = src/main.cpp src/ShareRedirector.cpp
+SRC = src/main.cpp src/ShareRedirector.cpp src/Glyph.cpp
 OBJ = $(SRC:src/%.cpp=build/%.o)
 # Versioned file name: Hyprland dlopens by path, so never overwrite a .so a live session has loaded.
-TARGET = build/hyprshare-v3.so
+TARGET = build/hyprshare-v4.so
 
 all: $(TARGET)
 
 $(TARGET): $(OBJ)
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) $^ -o $@ $(LDLIBS)
 
-build/%.o: src/%.cpp src/*.hpp | build check-tree
+build/%.o: src/%.cpp src/*.hpp | build $(TREE_CHECK)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
 build:

@@ -55,8 +55,8 @@ from** — not `/usr/include/hyprland`, which belongs to stock hyprland with dif
 GIT_TAG=v0.56.2-468-g9648898995 GIT_COMMITS=8129 GIT_COMMIT_DATE=2026-11-05 scripts/prepare-headers.sh
 
 # 2. Plugin and the test probe
-make              # -> build/hyprshare-v3.so (versioned: never overwrite a .so a session has loaded)
-make -C tests     # -> tests/build/capture-probe
+make              # -> build/hyprshare-v4.so (versioned: never overwrite a .so a session has loaded)
+make -C tests     # -> tests/build/{capture-probe,click-logger,vpointer}
 make hash         # shows the tree's commit next to the running compositor's
 ```
 
@@ -67,24 +67,31 @@ the tree's `build-pkg/compile_commands.json`). **Rebuild after every compositor 
 version mismatch the plugin refuses to load (it compares `__hyprland_api_get_hash()` with its own
 client hash in `pluginInit`, before hooking anything).
 
+For packaging, `make HYPRLAND_PC_DIR=/usr/lib/hypxrland/pkgconfig` takes the include paths from a
+hypxrland `hyprland.pc` instead of the source tree (untested until that headers package exists).
+The .so is linked `-z nodelete`: the compositor keeps pointers into it after unload (config value
+names, a decoration a hidden window only frees once shown again, pass-element vtables), and keeping
+the image mapped makes those inert instead of dangling.
+
 ## Load / unload (live session)
 
 ```sh
-hyprctl plugin load   /home/ajg/code/hyprshare/build/hyprshare-v3.so
-hyprctl plugin unload /home/ajg/code/hyprshare/build/hyprshare-v3.so
+hyprctl plugin load   /home/ajg/code/hyprshare/build/hyprshare-v4.so
+hyprctl plugin unload /home/ajg/code/hyprshare/build/hyprshare-v4.so
 hyprctl plugin list
 ```
 
-Unloading removes the hook, the hyprctl commands, the Lua functions, the frame listeners and the
-timer, restores the `screenshared` tags, and answers any pending placeholder frame; it **disowns**
+Unloading removes the hook, the hyprctl commands, the Lua functions, the glyph decorations, the
+frame/client/input listeners and the timer, removes the `screenshared` / `screenshare-mode` tags,
+and answers any pending placeholder frame; it **disowns**
 (does not destroy) the placeholder frame resources, so the portal client sees no protocol error.
 
 Hyprland `dlopen`s by path, so each build has its own file name. Upgrade by unloading the old path
 and loading the new one, e.g.:
 
 ```sh
-hyprctl plugin unload /home/ajg/code/hyprshare/build/hyprshare-v2.so
-hyprctl plugin load   /home/ajg/code/hyprshare/build/hyprshare-v3.so
+hyprctl plugin unload /home/ajg/code/hyprshare/build/hyprshare-v3.so
+hyprctl plugin load   /home/ajg/code/hyprshare/build/hyprshare-v4.so
 ```
 
 ## Use
@@ -96,6 +103,7 @@ hyprctl sharewindow                     # redirect active shares to the focused 
 hyprctl sharewindow address:0x55d1...   # ... or to a selected window
 hyprctl sharewindow class:firefox
 hyprctl shareclear                      # back to the windows picked in the portal
+hyprctl sharepause                      # pause: every active share shows the black placeholder
 hyprctl sharestatus                     # JSON, see below
 ```
 
@@ -106,12 +114,12 @@ Selectors are the compositor's own window selectors (`Desktop::CViewQuery::selec
 Under the **Lua** config, `hyprctl dispatch X` is evaluated as `hl.dispatch(X)`, so plugin
 dispatchers registered by name are *not* reachable through it — use the `hyprctl` commands above,
 or `hyprctl eval 'hl.plugin.hyprshare.share("address:0x…")'`. Under a hyprlang `.conf` the
-dispatchers `sharewindow` / `shareclear` exist too (`hyprctl dispatch sharewindow …`,
+dispatchers `sharewindow` / `shareclear` / `sharepause` exist too (`hyprctl dispatch sharewindow …`,
 `bind = SUPER CTRL ALT, S, sharewindow`) — that path is registered but was not tested.
 
 ### Lua binds
 
-The plugin registers `hl.plugin.hyprshare.share([selector])`, `.clear()` and `.status()`. They act
+The plugin registers `hl.plugin.hyprshare.share([selector])`, `.clear()`, `.pause()` and `.status()`. They act
 immediately and return `true` or `false, err` (they never raise). Wrap them in a function so the
 config still parses before the plugin is loaded:
 
@@ -119,6 +127,7 @@ config still parses before the plugin is loaded:
 -- Share the focused window instead (SUPER+ALT+S is taken: Omarchy scratchpad + XR stereo toggle).
 hl.bind("SUPER + CTRL + ALT + S", function() hl.plugin.hyprshare.share() end)
 hl.bind("SUPER + CTRL + ALT + SHIFT + S", function() hl.plugin.hyprshare.clear() end)
+hl.bind("SUPER + CTRL + ALT + P", function() hl.plugin.hyprshare.pause() end)
 ```
 
 Pressing them without the plugin loaded is a harmless Lua error (`hl.plugin.hyprshare` is nil).
@@ -133,20 +142,101 @@ hl.window_rule({
 })
 ```
 
+### The glyph (click to share / pause / resume)
+
+While any window share is active (in any state), every eligible window shows a small dot in a
+corner — top right by default:
+
+| state  | which window                         | default look             | click        |
+|--------|--------------------------------------|--------------------------|--------------|
+| LIVE   | the window currently being shared    | filled red dot           | pause        |
+| IDLE   | every other window                   | hollow white ring        | share it     |
+| PAUSED | the window whose share you paused    | filled amber, pause bars | resume it    |
+
+Pause is exactly the closed-window state: every active share shows the black placeholder, no
+window carries `screenshared`, nothing auto-resumes. `hyprctl sharepause` / `hl.plugin.hyprshare.pause()`
+do the same from a keybind; `sharewindow` also resumes.
+
+- Left click only, on release; a press that moves more than a few px (a drag) does nothing.
+  Glyph clicks never reach the window's client; clicks anywhere else are untouched. Clicks with a
+  modifier held (e.g. SUPER+drag binds) are left alone.
+- No share active → nothing drawn, no input taken. Fullscreen windows hide their glyph (configurable),
+  windows too small to hold it are skipped. Monitor scale and window opacity are respected.
+- The glyph never appears in the shared stream: window capture renders without decorations.
+- It is a plain window decoration drawn in the normal render pass (also on XR virtual monitors);
+  input comes from the cancellable `input.mouse.button` event, because Hyprland only routes
+  decoration clicks to decorations with a positioner box, which in-window (absolute) decorations
+  don't get.
+
+#### Styling (plugin config, from your Lua config)
+
+Hyprland itself knows nothing about this chrome; it's all plugin config, set with `hl.config`:
+
+```lua
+-- Guarded: the keys only exist once the plugin is loaded (loading it triggers a reload, which then
+-- applies them). Without the guard, an unloaded plugin makes these unknown-key config errors.
+if hl.plugin.hyprshare then
+    hl.config({
+        plugin = {
+            hyprshare = {
+                corner     = "top_right", -- your setup; this is also the default
+                offset_x   = 10,
+                offset_y   = 10,
+                size       = 14,
+                visibility = "all",       -- or "shared_only"
+            },
+        },
+    })
+end
+```
+
+| key (`plugin.hyprshare.*`) | default          | meaning                                                        |
+|----------------------------|------------------|----------------------------------------------------------------|
+| `corner`                   | `"top_right"`    | `top_right`, `top_left`, `bottom_right`, `bottom_left`         |
+| `offset_x`, `offset_y`     | `10`, `10`       | inset from the window's side / top-or-bottom edge, logical px  |
+| `size`                     | `14`             | glyph diameter, logical px                                     |
+| `outline`                  | `2`              | outline width, logical px                                      |
+| `opacity`                  | `1.0`            | multiplier, on top of the window's own opacity                 |
+| `visibility`               | `"all"`          | `all` windows, or `shared_only` (LIVE/PAUSED glyphs only)      |
+| `hide_fullscreen`          | `1`              | hide on fullscreen windows                                     |
+| `live_fill`, `live_outline`     | `rgba(ff3030ff)`, `rgba(ffffffe6)` | LIVE colours                    |
+| `idle_fill`, `idle_outline`     | `rgba(00000040)`, `rgba(ffffffd9)` | IDLE colours                    |
+| `paused_fill`, `paused_outline` | `rgba(ffb000ff)`, `rgba(ffffffe6)` | PAUSED colours (bars use outline) |
+
+Colours take the usual colour strings (`"rgba(rrggbbaa)"`, `"rgb(rrggbb)"`, …). Changes apply on
+config reload (`hyprctl reload`, or saving the config).
+
+#### `screenshare-mode` tag
+
+While any share is active every window carries the tag `screenshare-mode` (removed when the last
+share stops), so the whole desktop can look different during a share:
+
+```lua
+-- dim borders of everything while sharing; the shared window keeps its own rule below
+hl.window_rule({ name = "share-mode-borders", match = { tag = "screenshare-mode" }, border_color = "rgba(80808080)" })
+hl.window_rule({ name = "hyprshare-border",   match = { tag = "screenshared" },     border_color = "rgb(ff3030)" })
+```
+
 ### `sharestatus`
 
 ```json
 {
+  "shareMode": true,
   "target": {"address": "0x55df55a73ca0", "alive": true, "mapped": true, "class": "hsC", "title": "sh"},
+  "paused": null,
   "captures": [
-    {"pid": 246, "active": true, "state": "target", "lastSeenMsAgo": 25, "outstandingFrames": 0,
-     "placeholderFrames": 0, "origin": {"address": "0x55df55847710", "alive": false},
+    {"pid": 246, "active": true, "state": "target", "nothingReason": "", "lastSeenMsAgo": 25,
+     "outstandingFrames": 0, "placeholderFrames": 0, "origin": {"address": "0x55df55847710", "alive": false},
      "served": {"address": "0x55df55a73ca0", "alive": true, "mapped": true, "class": "hsC", "title": "sh"}}
-  ]
+  ],
+  "glyph": {"corner": "top_right", "visibility": "all",
+            "glyphs": [{"address": "0x55df55a73ca0", "state": "live", "box": [1176, 110, 14, 14]}]}
 }
 ```
 
-`state` is `origin`, `target` or `nothing` (serving a placeholder); `served` is null in `nothing`.
+`state` is `origin`, `target` or `nothing` (serving a placeholder); `served` is null in `nothing`,
+and `nothingReason` says why (`paused` or `closed`). `paused` is the window a pause will resume.
+`glyph.glyphs` lists the glyphs currently drawn, with their hit boxes in global layout coordinates.
 `pid` is the capturing client (XDPH in real use, not the app). Inactive captures are forgotten
 after 10 s.
 
@@ -165,15 +255,22 @@ can only run nested; the container keeps that off the live display. `tests/run-i
 environment, private `XDG_RUNTIME_DIR`/`HOME`, `HYPRLAND_NO_SD_VARS=1`, the real `hyprctl` binary
 and PID-tracked cleanup.
 
+Two suites run, each against a fresh nested compositor: `share` (the redirect/placeholder suite)
+and `glyph`. `HYPRSHARE_SUITES=glyph tests/run-in-container.sh` runs one.
+
 `tests/capture-probe` stands in for XDPH: a fresh capture request per frame, printing the
 advertised buffer size; `--app-id` uses XDPH's exact request
 (`capture_toplevel_with_wlr_toplevel_handle`, keeping the handle after the toplevel closes),
 `--handle` the uint variant, `--copy` copies into shm and `--copy-dmabuf` into a gbm dmabuf (the
 real XDPH/PipeWire path), both reading the first pixel back (`ready-black`/`ready-nonblack`);
 `--xdph` waits for frame events forever and re-requests after `failed` (patched XDPH). Every
-iteration it destroys the frame proxy and reports `display-ok` / `display-error` at the end.
+iteration it destroys the frame proxy and reports `display-ok` / `display-error` at the end;
+`--sample X Y` also prints the copied buffer's pixel there. `tests/click-logger` is a solid-colour
+xdg-shell window that prints every pointer button it receives; `tests/vpointer` injects moves,
+clicks and drags through `zwlr_virtual_pointer_v1` (a real pointer device to the compositor);
+on-screen pixels are read with `grim`.
 
-Covered (57 checks): load + hash check against the live binary; per-frame sizes before/after
+Share suite (57 checks): load + hash check against the live binary; per-frame sizes before/after
 `sharewindow`; two Electron-style sessions on one origin following; uint-handle path; real shm +
 dmabuf pixel copies; tag + border rule moving and expiring; `sharestatus` fields (also a layout
 sanity check: class and pid read through the plugin's view of the structs); Lua functions via
@@ -184,6 +281,17 @@ the tag on nobody; a new window appearing in **nothing** does not reveal it; `sh
 an origin closing while unredirected does the same. Crash-proofing: destroying frame proxies every
 iteration and the untracked null-handle → destroy sequence both post **no protocol error**; unload
 with a placeholder pending leaves the client unharmed; unload (tags gone, commands gone, hook out).
+
+Glyph suite (66 checks): no glyph without a share (and the screen shows window pixels there); LIVE
+and IDLE glyphs appear with a share, at the configured box, drawn on screen; the glyph is **not** in
+the stream (shm readback at the glyph spot = window colour); `screenshare-mode` on every window;
+clicking an IDLE glyph switches the share, the LIVE glyph pauses (black placeholder, `nothing` /
+`paused`, no `screenshared` tag), the PAUSED glyph resumes; glyph clicks never reach the client,
+clicks on content do; a drag from a glyph does nothing and leaks nothing; `sharepause` and Lua
+`pause()`; corner/offset change moves the hit box on reload (old spot passes clicks through),
+`shared_only` hides IDLE glyphs, colours apply; fullscreen hides the glyph; glyphs and the mode tag
+vanish when the share stops; a new client reusing a dead client's address starts clean; unload with
+glyphs visible → no crash, decorations gone, clicks reach the client, new windows get none.
 
 ## Known limitations (spike)
 
@@ -196,6 +304,13 @@ with a placeholder pending leaves the client unharmed; unload (tags gone, comman
   `sharewindow`. It never auto-recovers to any window — that is the intended privacy behaviour.
   Resuming onto a new target needs the patched XDPH (its `failed` → re-request recovery); stock XDPH
   keeps showing black after a swap-away.
+- **Pause can let one in-flight frame through.** A real frame the compositor already accepted before
+  the pause may still complete with window content; every later frame is the placeholder.
+- **Pause/resume is global.** Pausing pauses every active share and remembers one window to resume
+  (the first live one); resuming sends every share there.
+- **Glyph clicks are taken from the raw button event**, so they beat everything except an active
+  session lock / layer-surface focus and modified clicks. A glyph covered by another window is
+  covered for input too (the topmost window under the cursor owns the click).
 - **The placeholder renders off the output-commit cycle** (from a throttle timer). This is a plugin
   reaching into the compositor's renderer; validated on a real GPU in the container suite, but it is
   not a path the compositor itself exercises.

@@ -232,6 +232,9 @@ static void waitFor(struct wl_display* display, const bool* flag, int ms) {
 }
 
 // True if the first pixel (any 32bpp XRGB/ARGB variant) is opaque black.
+static long g_sampleX = -1, g_sampleY = -1; // --sample: also report this buffer pixel (shm only)
+static char g_sampleText[32] = "";
+
 static bool firstPixelBlack(const uint8_t* p) {
     return (p[0] & 0xFF) == 0 && (p[1] & 0xFF) == 0 && (p[2] & 0xFF) == 0;
 }
@@ -256,6 +259,12 @@ static const char* copyFrameShm(struct wl_display* display, struct hyprland_topl
     waitFor(display, &g_copyDone, 2000);
 
     const char* result = !g_copyDone ? "copytimeout" : g_copyReady ? (map != MAP_FAILED && firstPixelBlack(map) ? "ready-black" : "ready-nonblack") : "copyfailed";
+
+    g_sampleText[0] = 0;
+    if (g_copyReady && map != MAP_FAILED && g_sampleX >= 0 && g_sampleX < (long)g_width && g_sampleY >= 0 && g_sampleY < (long)g_height) {
+        const uint8_t* px = map + (size_t)g_sampleY * g_stride + (size_t)g_sampleX * 4; // XRGB/ARGB8888: B G R A
+        snprintf(g_sampleText, sizeof(g_sampleText), " px=%02x%02x%02x", px[2], px[1], px[0]);
+    }
 
     wl_buffer_destroy(buffer);
     wl_shm_pool_destroy(pool);
@@ -351,7 +360,10 @@ int main(int argc, char** argv) {
             xdph = true;
         else if (strcmp(argv[i], "--drm-node") == 0 && i + 1 < argc)
             drmNode = argv[++i];
-        else
+        else if (strcmp(argv[i], "--sample") == 0 && i + 2 < argc) {
+            g_sampleX = strtol(argv[++i], NULL, 0);
+            g_sampleY = strtol(argv[++i], NULL, 0);
+        } else
             return usage(argv[0]);
     }
 
@@ -427,9 +439,10 @@ int main(int argc, char** argv) {
             printf("frame %ld failed\n", n);
         else if (copyDmabuf)
             printf("frame %ld %ux%u %s\n", n, g_width, g_height, copyFrameDmabuf(display, frame));
-        else if (copy && g_shm)
-            printf("frame %ld %ux%u %s\n", n, g_width, g_height, copyFrameShm(display, frame));
-        else
+        else if (copy && g_shm) {
+            const char* r = copyFrameShm(display, frame);
+            printf("frame %ld %ux%u %s%s\n", n, g_width, g_height, r, g_sampleText);
+        } else
             printf("frame %ld %ux%u\n", n, g_width, g_height);
         fflush(stdout);
 

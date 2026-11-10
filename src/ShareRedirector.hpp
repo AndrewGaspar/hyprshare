@@ -31,6 +31,8 @@
 
 #include <wayland-server-core.h>
 
+#include "Glyph.hpp"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -73,8 +75,17 @@ namespace HyprShare {
         void            failFrame(wl_client* client, uint32_t version, uint32_t frameID);
 
         SDispatchResult shareWindow(const std::string& selector);
+        SDispatchResult shareWindowTarget(const PHLWINDOW& target); // also resumes a pause
         SDispatchResult clear();
+        // Every active capture goes to the sticky NOTHING placeholder state (same as a closed window);
+        // the window it was serving is remembered as the paused window.
+        SDispatchResult pause();
         std::string     statusJSON() const;
+
+        // For the glyphs: is any share active at all, and what should `window`'s glyph show?
+        bool        shareModeActive() const;
+        eGlyphState glyphStateFor(const PHLWINDOW& window) const;
+        void        onWindowOpened(const PHLWINDOW& window);
 
       private:
         // One (client, picked window) pair. Electron apps open 2-3 portal sessions per share, but XDPH
@@ -93,7 +104,8 @@ namespace HyprShare {
                 FOLLOW_TARGET, // serve the global redirect target
             } mode = FOLLOW_ORIGIN;
 
-            bool            nothing = false; // sticky: served window died; serve placeholder until an explicit share
+            bool            nothing      = false; // sticky: served window died; serve placeholder until an explicit share
+            bool            pausedByUser = false; // the NOTHING came from pause(), not a closed window
 
             Time::steady_tp lastSeen;
             uint32_t        outstandingFrames = 0; // frame objects alive (real or placeholder)
@@ -110,6 +122,15 @@ namespace HyprShare {
             wl_listener       listener  = {};
             uint64_t          captureID = 0;
             CShareRedirector* owner     = nullptr;
+        };
+
+        // A destroy listener on a capturing wl_client: its captures die with it. Without this a new
+        // client that happens to get the same wl_client address (e.g. a restarted portal) would
+        // inherit the old client's redirect/pause state.
+        struct SClientWatch {
+            wl_listener       listener = {};
+            wl_client*        client   = nullptr; // identity only
+            CShareRedirector* owner    = nullptr;
         };
 
         // A frame object we created ourselves to serve a placeholder.
@@ -129,8 +150,13 @@ namespace HyprShare {
 
         std::vector<SCapture>              m_captures;
         PHLWINDOWREF                       m_target;
+        PHLWINDOWREF                       m_paused; // the window whose share the user paused
         std::vector<PHLWINDOWREF>          m_tagged;
+        std::vector<PHLWINDOWREF>          m_modeTagged; // windows carrying `screenshare-mode`
+        bool                               m_modeActive = false;
+        std::string                        m_glyphFingerprint;
         std::vector<UP<SFrameWatch>>       m_frameWatches;
+        std::vector<UP<SClientWatch>>      m_clientWatches;
         std::vector<UP<SPlaceholderFrame>> m_placeholders;
         uint64_t                           m_nextCaptureID = 1;
 
@@ -148,6 +174,9 @@ namespace HyprShare {
 
         void        onFrameDestroyed(SFrameWatch* watch);
         static void onFrameDestroyedThunk(wl_listener* listener, void* data);
+        void        watchClient(wl_client* client);
+        void        onClientDestroyed(SClientWatch* watch);
+        static void onClientDestroyedThunk(wl_listener* listener, void* data);
 
         void        doPlaceholderCopy(SPlaceholderFrame* frame);
         bool        renderPlaceholder(const SP<IHLBuffer>& buffer, const Vector2D& size, PHLMONITOR monitor);
@@ -158,7 +187,9 @@ namespace HyprShare {
         void        onTick();
         void        prune(Time::steady_tp now);
         void        updateTags();
-        void        onShareChanged(); // after share/clear: refresh served, release placeholders, tags
+        void        syncModeTags(bool force); // `screenshare-mode` on every window while a share is active
+        void        refreshGlyphs();          // damage glyphs if their states changed
+        void        onShareChanged();         // after share/clear: refresh served, release placeholders, tags
     };
 
     UP<CShareRedirector>& redirector();

@@ -4,6 +4,7 @@
 // the original a different window. See ShareRedirector.hpp for the policy, README.md for usage.
 
 #include "PrivateAccess.hpp"
+#include "Glyph.hpp"
 #include "ShareRedirector.hpp"
 
 #include <src/plugins/PluginAPI.hpp>
@@ -82,6 +83,12 @@ static SDispatchResult dispatchShareWindow(std::string args) {
     return redirector()->shareWindow(args);
 }
 
+static SDispatchResult dispatchSharePause(std::string args) {
+    if (!redirector())
+        return {.success = false, .error = "hyprshare: not initialized"};
+    return redirector()->pause();
+}
+
 static SDispatchResult dispatchShareClear(std::string args) {
     if (!redirector())
         return {.success = false, .error = "hyprshare: not initialized"};
@@ -112,6 +119,10 @@ static std::string ctlShareWindow(eHyprCtlOutputFormat, std::string request) {
     return resultString(dispatchShareWindow(commandArgs(request)));
 }
 
+static std::string ctlSharePause(eHyprCtlOutputFormat, std::string request) {
+    return resultString(dispatchSharePause(""));
+}
+
 static std::string ctlShareClear(eHyprCtlOutputFormat, std::string request) {
     return resultString(dispatchShareClear(""));
 }
@@ -140,6 +151,10 @@ static int luaShare(lua_State* L) {
     }
 
     return luaReturn(L, dispatchShareWindow(selector));
+}
+
+static int luaPause(lua_State* L) {
+    return luaReturn(L, dispatchSharePause(""));
 }
 
 static int luaClear(lua_State* L) {
@@ -183,6 +198,9 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     if (!target)
         failInit(std::format("could not find {}", CAPTURE_TOPLEVEL_SIGNATURE));
 
+    // Config values may only be registered during pluginInit.
+    registerGlyphConfig(PHANDLE);
+
     redirector() = makeUnique<CShareRedirector>();
 
     g_pCaptureToplevelHook = HyprlandAPI::createFunctionHook(PHANDLE, target, rc<void*>(&hkCaptureToplevel));
@@ -193,17 +211,24 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     HyprlandAPI::addDispatcherV2(PHANDLE, "sharewindow", dispatchShareWindow);
     HyprlandAPI::addDispatcherV2(PHANDLE, "shareclear", dispatchShareClear);
+    HyprlandAPI::addDispatcherV2(PHANDLE, "sharepause", dispatchSharePause);
 
     HyprlandAPI::registerHyprCtlCommand(PHANDLE, SHyprCtlCommand{.name = "sharewindow", .exact = false, .fn = ctlShareWindow});
     HyprlandAPI::registerHyprCtlCommand(PHANDLE, SHyprCtlCommand{.name = "shareclear", .exact = false, .fn = ctlShareClear});
+    HyprlandAPI::registerHyprCtlCommand(PHANDLE, SHyprCtlCommand{.name = "sharepause", .exact = false, .fn = ctlSharePause});
     HyprlandAPI::registerHyprCtlCommand(PHANDLE, SHyprCtlCommand{.name = "sharestatus", .exact = false, .fn = ctlShareStatus});
 
     // Only exists under the Lua front end; returns false (harmlessly) under hyprlang.
     HyprlandAPI::addLuaFunction(PHANDLE, "hyprshare", "share", luaShare);
     HyprlandAPI::addLuaFunction(PHANDLE, "hyprshare", "clear", luaClear);
+    HyprlandAPI::addLuaFunction(PHANDLE, "hyprshare", "pause", luaPause);
     HyprlandAPI::addLuaFunction(PHANDLE, "hyprshare", "status", luaStatus);
 
-    return {"hyprshare", "Redirect running window shares to another window (spike)", "Andrew Gaspar", "0.1"};
+    // Glyph decorations on every window (drawn only while a share is active), new ones on open.
+    glyphs() = makeUnique<CGlyphManager>(PHANDLE);
+    glyphs()->attachAll();
+
+    return {"hyprshare", "Redirect running window shares to another window (spike)", "Andrew Gaspar", "0.4"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
@@ -213,5 +238,7 @@ APICALL EXPORT void PLUGIN_EXIT() {
         HyprlandAPI::removeFunctionHook(PHANDLE, g_pCaptureToplevelHook);
     g_pCaptureToplevelHook = nullptr;
 
+    // Glyphs first: detaching them damages and queues removal, and their state reads the redirector.
+    glyphs().reset();
     redirector().reset();
 }

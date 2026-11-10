@@ -23,7 +23,7 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(dirname "$HERE")"
-PLUGIN="$(realpath "${1:-$ROOT/build/hyprshare-v2.so}")"
+PLUGIN="$(realpath "${1:-$ROOT/build/hyprshare-v4.so}")"
 HYPRLAND_BIN="${HYPRLAND_BIN:-/usr/lib/hypxrland/Hyprland}"
 HYPRCTL_BIN="${HYPRCTL_BIN:-/usr/lib/hypxrland/hyprctl}"
 PROBE="$HERE/build/capture-probe"
@@ -82,6 +82,12 @@ ISOLATED_ENV=(
     LANG=C.UTF-8
 )
 
+# Work on a copy of the config (+ a rewritable glyph styling file) so tests can edit and reload.
+cp "$CONFIG" "$T/config.lua"
+CONFIG="$T/config.lua"
+GLYPH_CONF="$T/glyph.lua"
+: >"$GLYPH_CONF"
+
 pass() { PASSES=$((PASSES + 1)); echo "PASS: $*"; }
 fail() { FAILS=$((FAILS + 1)); echo "FAIL: $*"; }
 expect_eq() { # what expected actual
@@ -94,7 +100,7 @@ expect_match() { # what glob actual
 
 # --- compositor -------------------------------------------------------------------------------
 "${ISOLATED_ENV[@]}" HYPRLAND_HEADLESS_ONLY=1 HYPRLAND_NO_SD_VARS=1 HYPRLAND_NO_SD_NOTIFY=1 \
-    WAYLAND_DISPLAY="$NEST_WAYLAND" ${HYPRLAND_LIBRARY_PATH:+LD_LIBRARY_PATH="$HYPRLAND_LIBRARY_PATH"} \
+    WAYLAND_DISPLAY="$NEST_WAYLAND" HYPRSHARE_GLYPH_CONF="$GLYPH_CONF" ${HYPRLAND_LIBRARY_PATH:+LD_LIBRARY_PATH="$HYPRLAND_LIBRARY_PATH"} \
     "$HYPRLAND_BIN" --config "$CONFIG" >"$T/logs/hyprland.out" 2>&1 &
 COMPOSITOR_PID=$!
 
@@ -143,6 +149,8 @@ spawn_window() { # class
 addr_of() { ctl clients -j | jq -r --arg c "$1" '.[] | select(.class == $c) | .address' | head -1; }
 size_of() { ctl clients -j | jq -r --arg c "$1" '.[] | select(.class == $c) | "\(.size[0])x\(.size[1])"' | head -1; }
 tags_of() { ctl clients -j | jq -r --arg c "$1" '.[] | select(.class == $c) | .tags | join(",")' | head -1; }
+# Just the `screenshared` tag (every window also carries `screenshare-mode` during a share).
+sharetag_of() { ctl clients -j | jq -r --arg c "$1" '.[] | select(.class == $c) | [.tags[] | select(. == "screenshared")] | join(",")' | head -1; }
 border_of() { ctl getprop "address:$(addr_of "$1")" active_border_color 2>/dev/null; }
 
 spawn_window hsA
@@ -170,6 +178,16 @@ start_probe() { # name args...
 last_size() { tail -1 "$T/logs/$1.out" | awk '{print $3}'; }
 status() { ctl sharestatus; }
 
+if [[ "${SUITE:-share}" == glyph ]]; then
+    # shellcheck source=glyph-suite.sh
+    source "$HERE/glyph-suite.sh"
+    ctl rollinglog >"$T/logs/rolling.log" 2>/dev/null
+    echo
+    echo "$PASSES passed, $FAILS failed"
+    ((FAILS == 0))
+    exit $?
+fi
+
 start_probe p1 --app-id hsA --interval-ms 50
 start_probe p2 --app-id hsA --interval-ms 80
 start_probe p3 --handle "$((A & 0xFFFFFFFF))" --interval-ms 50
@@ -181,7 +199,7 @@ expect_eq "p1 captures A before any redirect" "$SIZE_A" "$(last_size p1)"
 expect_eq "p3 (uint handle) captures A" "$SIZE_A" "$(last_size p3)"
 expect_match "cp copies A (shm)" "$SIZE_A ready*" "$(tail -1 "$T/logs/cp.out" | cut -d' ' -f3-)"
 expect_eq "sharestatus sees one active capture per client" "4" "$(status | jq '[.captures[] | select(.active)] | length')"
-expect_eq "A tagged while shared" "screenshared" "$(tags_of hsA)"
+expect_eq "A tagged while shared" "screenshared" "$(sharetag_of hsA)"
 expect_eq "border rule colors A" "ffff3030 0deg" "$(border_of hsA)"
 
 # --- redirect A -> B via hyprctl command --------------------------------------------------------
@@ -193,9 +211,9 @@ expect_eq "p3 follows" "$SIZE_B" "$(last_size p3)"
 sleep 0.3
 expect_match "cp copies B's pixels into a B-sized buffer" "$SIZE_B ready*" "$(tail -1 "$T/logs/cp.out" | cut -d' ' -f3-)"
 kill "$PID_cp" 2>/dev/null
-expect_eq "tag moved to B" "screenshared" "$(tags_of hsB)"
+expect_eq "tag moved to B" "screenshared" "$(sharetag_of hsB)"
 sleep 1.2
-expect_eq "tag removed from A ~1s after it stopped being served" "" "$(tags_of hsA)"
+expect_eq "tag removed from A ~1s after it stopped being served" "" "$(sharetag_of hsA)"
 expect_eq "sharestatus target is B" "$B" "$(status | jq -r '.target.address')"
 # Fields read through the plugin's view of CWindow / wl_client: garbage here would mean an ABI mismatch.
 expect_eq "sharestatus reads CWindow::m_class (layout sanity)" "hsB" "$(status | jq -r '.target.class')"
@@ -228,7 +246,7 @@ sleep 0.6
 expect_eq "after clear p1 is back on A" "$SIZE_A" "$(last_size p1)"
 expect_eq "after clear: state origin, target null" "origin|null" "$(status | jq -r "[.captures[] | select(.pid == $PID_p1)][0].state")|$(status | jq -r '.target')"
 sleep 1.2
-expect_eq "after clear: tag back on A only" "screenshared|" "$(tags_of hsA)|$(tags_of hsB)"
+expect_eq "after clear: tag back on A only" "screenshared|" "$(sharetag_of hsA)|$(sharetag_of hsB)"
 
 # --- PRIVACY: target closed does NOT reveal the picked window; capture goes to NOTHING ------------
 # dcp/scp are copy probes for hsA so the placeholder's actual pixels can be read back; they follow
@@ -246,7 +264,7 @@ expect_eq "target B closed: p1 is NOT back on A" "true" "$([[ "$(last_size p1)" 
 expect_eq "target B closed: p1 served the placeholder at B's last size" "$SIZE_B" "$(last_size p1)"
 expect_eq "target B closed: capture state is nothing" "nothing" "$(capture_field p1 state)"
 expect_eq "target B closed: served is null (nobody)" "false" "$(capture_field p1 'served.alive')"
-expect_eq "target B closed: tag on nobody (A untagged)" "" "$(tags_of hsA)"
+expect_eq "target B closed: tag on nobody (A untagged)" "" "$(sharetag_of hsA)"
 expect_eq "target B closed: compositor alive" "0" "$(kill -0 "$COMPOSITOR_PID" 2>/dev/null; echo $?)"
 
 # Placeholder pixels are black, via a REAL dmabuf copy (the path XDPH/PipeWire uses) and via shm.
@@ -272,7 +290,7 @@ kill "$PID_dcp" "$PID_scp" 2>/dev/null
 expect_eq "sharewindow class:hsC resumes the NOTHING capture" "ok" "$(ctl sharewindow class:hsC)"
 sleep 0.8
 expect_eq "p1 resumes on C after explicit share" "$SIZE_C" "$(last_size p1)"
-expect_eq "C tagged" "screenshared" "$(tags_of hsC)"
+expect_eq "C tagged" "screenshared" "$(sharetag_of hsC)"
 
 # --- origin closed while UNREDIRECTED -> NOTHING -> explicit share resumes ------------------------
 spawn_window hsD
@@ -315,7 +333,7 @@ expect_eq "xF now in NOTHING (placeholder) before unload" "nothing" "$(capture_f
 # --- unload -----------------------------------------------------------------------------------
 expect_eq "plugin unload (with a placeholder pending)" "ok" "$(ctl plugin unload "$PLUGIN" | tail -1)"
 sleep 0.5
-expect_eq "tag removed on unload" "" "$(tags_of hsC)"
+expect_eq "tag removed on unload" "" "$(sharetag_of hsC)"
 expect_eq "sharestatus gone after unload" "unknown request" "$(ctl sharestatus)"
 sleep 0.5
 expect_eq "compositor alive after unload" "0" "$(kill -0 "$COMPOSITOR_PID" 2>/dev/null; echo $?)"
@@ -326,6 +344,7 @@ kill "$PID_xF" 2>/dev/null
 wait "$PID_xF" 2>/dev/null
 expect_eq "xF survived unload with no protocol error" "0" "$(grep -c 'invalid object' "$T/logs/xF.err")"
 
+ctl rollinglog >"$T/logs/rolling.log" 2>/dev/null
 grep -i "hyprshare\|captureToplevel\|Couldn't capture" "$T/run/hypr/$HIS/hyprland.log" 2>/dev/null | tail -10 > "$T/logs/plugin-lines.log"
 
 echo "--- final sharestatus sample (pre-unload) is in $T/logs/status.json"
