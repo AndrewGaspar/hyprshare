@@ -54,18 +54,25 @@ static void hkCaptureToplevel(CToplevelExportClient* self, uint32_t frame, int32
 
     const auto DECISION = redirector()->onCaptureRequest(CLIENT, handle);
 
-    if (DECISION.hold) {
-        // The original would log and return without creating the frame object (see holdFrame).
+    // For ACT_PLACEHOLDER / ACT_FAIL we must create the frame object for the client's new_id
+    // OURSELVES: the original returns early for a null window without creating it, which leaves the
+    // id a NULL object and kills the portal on the next destroy. We need the manager's version to
+    // create a matching resource.
+    if (DECISION.action != CShareRedirector::ACT_SERVE) {
         const auto& MANAGER = self->*privateMember(SManagerResourceTag{});
         if (MANAGER && MANAGER->resource()) {
-            redirector()->holdFrame(CLIENT, MANAGER->version(), frame, DECISION.captureID);
+            if (DECISION.action == CShareRedirector::ACT_PLACEHOLDER)
+                redirector()->placeholderFrame(CLIENT, MANAGER->version(), frame, DECISION.captureID);
+            else
+                redirector()->failFrame(CLIENT, MANAGER->version(), frame);
             return;
         }
+        // No manager resource (shouldn't happen): fall through to the original rather than drop.
     }
 
     ORIGINAL(self, frame, overlayCursor, DECISION.window);
 
-    if (DECISION.captureID != 0)
+    if (DECISION.action == CShareRedirector::ACT_SERVE && DECISION.captureID != 0)
         redirector()->watchFrame(CLIENT, frame, DECISION.captureID);
 }
 

@@ -49,8 +49,8 @@ podman run --rm --name "$NAME" \
         for _ in $(seq 100); do [[ -S "$NEST/wayland-0" ]] && break; sleep 0.1; done
         [[ -S "$NEST/wayland-0" ]] || { echo "labwc did not come up"; cat /logs/labwc.out; exit 1; }
         NEST_WAYLAND="$NEST/wayland-0" HYPRLAND_BIN=/opt/hypxrland/Hyprland HYPRCTL_BIN=/opt/hypxrland/hyprctl \
-            HYPRLAND_LIBRARY_PATH=/opt/hostlibs TERM_BIN=/usr/bin/kitty LOG_EXPORT_DIR=/logs \
-            /hyprshare/tests/run-isolated.sh /hyprshare/build/hyprshare-v2.so
+            HYPRLAND_LIBRARY_PATH=/opt/hostlibs TERM_BIN=/usr/bin/kitty LOG_EXPORT_DIR=/logs DRM_NODE="$GPU" \
+            /hyprshare/tests/run-isolated.sh /hyprshare/build/hyprshare-v3.so
         RC=$?
         kill "$LABWC" 2>/dev/null
         exit $RC

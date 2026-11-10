@@ -19,22 +19,26 @@ original a different window. XDPH sees a size change and renegotiates its PipeWi
   frame in the last ~1 s, or still holds a frame object (a static window keeps one frame pending,
   waiting for damage). XDPH multiplexes every portal session over one connection, so the 2–3
   sessions an Electron app opens for one share collapse into one capture and all follow together.
-- **`sharewindow [selector]`** redirects every *active* capture (by the window XDPH originally
-  asked for) to the target, and retargets all existing redirects. Shares started later are left
-  alone until the next `sharewindow`. **`shareclear`** drops all redirects.
-- **Target closes** → shares fall back to their picked windows; redirects are dropped.
-- **Picked window closes while redirected** → the share keeps showing the target. (XDPH keeps
-  capturing the closed foreign-toplevel handle, which then resolves to no window at all; the
-  plugin recognises that client's dead, redirected capture and keeps serving the target.)
-- **Nothing live left to serve** (the shared window closed with no redirect, or the picked window
-  is gone and the target closed too) → the plugin *holds* the frame: it creates the frame object
-  the compositor would otherwise silently drop, and sends nothing on it. The consumer keeps its
-  last frame, the capture stays active, and the next `sharewindow` sends that frame one `failed`;
-  the portal (patched XDPH) re-requests at once and the share resumes on the new target. Without
-  this, the portal waits forever for a frame that never comes and the share can't be moved.
-- The window actually being served to an active capture carries the tag **`screenshared`**; it
-  moves with redirects and is removed ~1 s after the window stops being served, on clear, and on
-  unload.
+- **`sharewindow [selector]`** redirects every *active* capture to the target. Captures sit in one
+  of three states: **origin** (serving the window XDPH picked), **target** (following the global
+  redirect target), or **nothing** (see below). XDPH multiplexes every portal session over one
+  connection, so the 2–3 sessions an Electron app opens for one share collapse into one capture and
+  all follow together. Shares started later are left alone until the next `sharewindow`.
+- **`shareclear`** sends every capture back to the window its own portal picked (state → origin).
+- **Closing the shared window never reveals another window** (privacy). Whenever the window a
+  capture is serving dies — the picked window, or a redirect target — the capture enters the sticky
+  **nothing** state and is served a **black placeholder** at the last advertised size (so nothing
+  renegotiates) until you explicitly `sharewindow` again. A target closing does **not** fall back to
+  the picked window; a new window (even one that reuses a dead window's address) does not leave the
+  state. State is keyed on the capture, never on an address.
+- **Every capture request always gets a real frame and an answer.** 0.56's `captureToplevel`
+  returns early for a null window *without creating the frame resource*; libwayland then leaves that
+  new-id a NULL object, and the client's next destroy on it posts `wl_display error 0 (invalid
+  object)` and kills the portal. The plugin creates the resource itself for every request (a
+  placeholder, or `failed` for an unknown/untracked null) so this can't happen.
+- The window actually being served to an active capture carries the tag **`screenshared`** (nobody
+  in the nothing state); it moves with redirects and is removed ~1 s after the window stops being
+  served, on clear, and on unload.
 
 Everything runs on the compositor main thread (Wayland requests, dispatchers, hyprctl, Lua,
 event-loop timers). Nothing touches the XR frame thread.
@@ -51,7 +55,7 @@ from** — not `/usr/include/hyprland`, which belongs to stock hyprland with dif
 GIT_TAG=v0.56.2-468-g9648898995 GIT_COMMITS=8129 GIT_COMMIT_DATE=2026-11-05 scripts/prepare-headers.sh
 
 # 2. Plugin and the test probe
-make              # -> build/hyprshare-v2.so (versioned: never overwrite a .so a session has loaded)
+make              # -> build/hyprshare-v3.so (versioned: never overwrite a .so a session has loaded)
 make -C tests     # -> tests/build/capture-probe
 make hash         # shows the tree's commit next to the running compositor's
 ```
@@ -66,19 +70,21 @@ client hash in `pluginInit`, before hooking anything).
 ## Load / unload (live session)
 
 ```sh
-hyprctl plugin load   /home/ajg/code/hyprshare/build/hyprshare-v2.so
-hyprctl plugin unload /home/ajg/code/hyprshare/build/hyprshare-v2.so
+hyprctl plugin load   /home/ajg/code/hyprshare/build/hyprshare-v3.so
+hyprctl plugin unload /home/ajg/code/hyprshare/build/hyprshare-v3.so
 hyprctl plugin list
 ```
 
-Unloading removes the hook, the hyprctl commands, the Lua functions, the frame listeners, the timer
-and the `screenshared` tags; held frames get `failed`; running shares go back to the picked windows.
+Unloading removes the hook, the hyprctl commands, the Lua functions, the frame listeners and the
+timer, restores the `screenshared` tags, and answers any pending placeholder frame; it **disowns**
+(does not destroy) the placeholder frame resources, so the portal client sees no protocol error.
 
-Hyprland `dlopen`s by path, so a new build gets a new file name. Upgrading from the first build:
+Hyprland `dlopen`s by path, so each build has its own file name. Upgrade by unloading the old path
+and loading the new one, e.g.:
 
 ```sh
-hyprctl plugin unload /home/ajg/code/hyprshare/build/hyprshare.so
-hyprctl plugin load   /home/ajg/code/hyprshare/build/hyprshare-v2.so
+hyprctl plugin unload /home/ajg/code/hyprshare/build/hyprshare-v2.so
+hyprctl plugin load   /home/ajg/code/hyprshare/build/hyprshare-v3.so
 ```
 
 ## Use
@@ -132,17 +138,15 @@ hl.window_rule({
 ```json
 {
   "target": {"address": "0x55df55a73ca0", "alive": true, "mapped": true, "class": "hsC", "title": "sh"},
-  "redirectedOrigins": [
-    {"address": "0x55df55847710", "alive": false}
-  ],
   "captures": [
-    {"pid": 246, "active": true, "redirected": true, "lastSeenMsAgo": 25, "outstandingFrames": 0,
-     "origin": {"address": "0x55df55847710", "alive": false},
+    {"pid": 246, "active": true, "state": "target", "lastSeenMsAgo": 25, "outstandingFrames": 0,
+     "placeholderFrames": 0, "origin": {"address": "0x55df55847710", "alive": false},
      "served": {"address": "0x55df55a73ca0", "alive": true, "mapped": true, "class": "hsC", "title": "sh"}}
   ]
 }
 ```
 
+`state` is `origin`, `target` or `nothing` (serving a placeholder); `served` is null in `nothing`.
 `pid` is the capturing client (XDPH in real use, not the app). Inactive captures are forgotten
 after 10 s.
 
@@ -164,19 +168,22 @@ and PID-tracked cleanup.
 `tests/capture-probe` stands in for XDPH: a fresh capture request per frame, printing the
 advertised buffer size; `--app-id` uses XDPH's exact request
 (`capture_toplevel_with_wlr_toplevel_handle`, keeping the handle after the toplevel closes),
-`--handle` the uint variant, `--hold` keeps a frame pending, `--copy` really copies into shm,
-`--xdph` waits for frame events forever and re-requests after `failed` (patched XDPH).
+`--handle` the uint variant, `--copy` copies into shm and `--copy-dmabuf` into a gbm dmabuf (the
+real XDPH/PipeWire path), both reading the first pixel back (`ready-black`/`ready-nonblack`);
+`--xdph` waits for frame events forever and re-requests after `failed` (patched XDPH). Every
+iteration it destroys the frame proxy and reports `display-ok` / `display-error` at the end.
 
-Covered (64 checks): load + hash check against the live binary; per-frame sizes before/after
-`sharewindow`; two sessions on one origin following; uint-handle path; real pixel copies into a
-B-sized buffer after the redirect; tag + border rule moving and expiring; `sharestatus` fields
-(also a layout sanity check: class and pid read through the plugin's view of the structs); Lua
-functions via `hyprctl eval`, error returns, surviving `hyprctl reload`; `shareclear`; target
-closing (fallback); picked window closing (keeps serving the target, both handle paths); a held
-frame keeping a capture active; the shared window closing with nothing redirected (held, no
-`failed`, capture active → `sharewindow` releases it with exactly one `failed` → resumes on the
-target); picked window dead + target closed (held → `sharewindow` → resumes); a held frame at unload
-getting `failed`; unload (tags gone, commands gone, hook really out).
+Covered (57 checks): load + hash check against the live binary; per-frame sizes before/after
+`sharewindow`; two Electron-style sessions on one origin following; uint-handle path; real shm +
+dmabuf pixel copies; tag + border rule moving and expiring; `sharestatus` fields (also a layout
+sanity check: class and pid read through the plugin's view of the structs); Lua functions via
+`hyprctl eval`, error returns, surviving `hyprctl reload`; `shareclear` = back to the picked window.
+Privacy/placeholder: a target closing goes to **nothing** (not back to the origin) and serves a
+black placeholder at the target's last size — verified black via both shm and dmabuf readback — with
+the tag on nobody; a new window appearing in **nothing** does not reveal it; `sharewindow` resumes;
+an origin closing while unredirected does the same. Crash-proofing: destroying frame proxies every
+iteration and the untracked null-handle → destroy sequence both post **no protocol error**; unload
+with a placeholder pending leaves the client unharmed; unload (tags gone, commands gone, hook out).
 
 ## Known limitations (spike)
 
@@ -185,8 +192,13 @@ getting `failed`; unload (tags gone, commands gone, hook really out).
 - **One global target.** All redirected shares show the same window; no per-share targeting.
 - **Only shares active at `sharewindow` time** are redirected; a share started later needs another
   `sharewindow`.
-- **Nothing live to serve** → the stream freezes on its last frame (held) until the next
-  `sharewindow`; unpatched XDPH has no `failed` recovery, so resuming needs the patched portal.
+- **In the nothing state the consumer sees a black placeholder**, at ~10 fps, until the next
+  `sharewindow`. It never auto-recovers to any window — that is the intended privacy behaviour.
+  Resuming onto a new target needs the patched XDPH (its `failed` → re-request recovery); stock XDPH
+  keeps showing black after a swap-away.
+- **The placeholder renders off the output-commit cycle** (from a throttle timer). This is a plugin
+  reaching into the compositor's renderer; validated on a real GPU in the container suite, but it is
+  not a path the compositor itself exercises.
 - **Screencast indicators may flicker or lie.** Each (client, window) is its own compositor
   screenshare session: on a swap the target's session starts (`screencast>>1,…` IPC event) and
   the picked window's session stops ~500 ms later (`screencast>>0,…`). Anything counting those

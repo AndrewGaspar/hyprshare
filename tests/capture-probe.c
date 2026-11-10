@@ -33,9 +33,12 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <fcntl.h>
+#include <gbm.h>
 #include <wayland-client.h>
 
 #include "hyprland-toplevel-export-v1-client.h"
+#include "linux-dmabuf-v1-client.h"
 #include "wlr-foreign-toplevel-management-unstable-v1-client.h"
 
 struct SToplevel {
@@ -48,6 +51,10 @@ static struct hyprland_toplevel_export_manager_v1* g_exportManager   = NULL;
 static uint32_t                                    g_exportVersion   = 0;
 static struct zwlr_foreign_toplevel_manager_v1*    g_toplevelManager = NULL;
 static struct wl_shm*                              g_shm             = NULL;
+static struct zwp_linux_dmabuf_v1*                 g_dmabuf          = NULL;
+static uint32_t                                    g_dmabufFormat = 0, g_dmabufW = 0, g_dmabufH = 0;
+static struct gbm_device*                          g_gbm         = NULL;
+static struct wl_buffer*                           g_paramBuffer = NULL;
 static struct SToplevel                            g_toplevels[256];
 static size_t                                      g_toplevelCount = 0;
 
@@ -64,6 +71,8 @@ static void                                        onRegistryGlobal(void* data, 
         g_toplevelManager = wl_registry_bind(registry, name, &zwlr_foreign_toplevel_manager_v1_interface, version < 3 ? version : 3);
     else if (strcmp(interface, wl_shm_interface.name) == 0)
         g_shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
+    else if (strcmp(interface, zwp_linux_dmabuf_v1_interface.name) == 0)
+        g_dmabuf = wl_registry_bind(registry, name, &zwp_linux_dmabuf_v1_interface, version < 3 ? version : 3);
 }
 
 static void onRegistryGlobalRemove(void* data, struct wl_registry* registry, uint32_t name) {
@@ -170,8 +179,23 @@ static void onFrameFailed(void* data, struct hyprland_toplevel_export_frame_v1* 
 }
 
 static void onFrameDmabuf(void* data, struct hyprland_toplevel_export_frame_v1* f, uint32_t format, uint32_t width, uint32_t height) {
-    ;
+    g_dmabufFormat = format;
+    g_dmabufW      = width;
+    g_dmabufH      = height;
 }
+
+static void onParamsCreated(void* data, struct zwp_linux_buffer_params_v1* params, struct wl_buffer* buffer) {
+    g_paramBuffer = buffer;
+}
+
+static void onParamsFailed(void* data, struct zwp_linux_buffer_params_v1* params) {
+    g_paramBuffer = NULL;
+}
+
+static const struct zwp_linux_buffer_params_v1_listener PARAMS_LISTENER = {
+    .created = onParamsCreated,
+    .failed  = onParamsFailed,
+};
 
 static void onFrameBufferDone(void* data, struct hyprland_toplevel_export_frame_v1* f) {
     g_frameDone = true;
@@ -207,12 +231,21 @@ static void waitFor(struct wl_display* display, const bool* flag, int ms) {
     }
 }
 
-// Copy the frame into a fresh shm buffer. Returns "ready", "copyfailed" or "copytimeout".
-static const char* copyFrame(struct wl_display* display, struct hyprland_toplevel_export_frame_v1* frame) {
+// True if the first pixel (any 32bpp XRGB/ARGB variant) is opaque black.
+static bool firstPixelBlack(const uint8_t* p) {
+    return (p[0] & 0xFF) == 0 && (p[1] & 0xFF) == 0 && (p[2] & 0xFF) == 0;
+}
+
+// Copy the frame into a fresh shm buffer. Returns ready[-black|-nonblack], copyfailed or copytimeout.
+static const char* copyFrameShm(struct wl_display* display, struct hyprland_toplevel_export_frame_v1* frame) {
     const size_t size = (size_t)g_stride * g_height;
     const int    fd   = memfd_create("capture-probe", MFD_CLOEXEC);
     if (fd < 0 || ftruncate(fd, (off_t)size) != 0)
         return "copyfailed";
+
+    uint8_t* map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (map != MAP_FAILED)
+        memset(map, 0x7f, size); // fill grey first, so "black" readback means the copy really wrote
 
     struct wl_shm_pool* pool   = wl_shm_create_pool(g_shm, fd, (int32_t)size);
     struct wl_buffer*   buffer = wl_shm_pool_create_buffer(pool, 0, (int32_t)g_width, (int32_t)g_height, (int32_t)g_stride, g_format);
@@ -222,15 +255,69 @@ static const char* copyFrame(struct wl_display* display, struct hyprland_topleve
     wl_display_flush(display);
     waitFor(display, &g_copyDone, 2000);
 
+    const char* result = !g_copyDone ? "copytimeout" : g_copyReady ? (map != MAP_FAILED && firstPixelBlack(map) ? "ready-black" : "ready-nonblack") : "copyfailed";
+
     wl_buffer_destroy(buffer);
     wl_shm_pool_destroy(pool);
+    if (map != MAP_FAILED)
+        munmap(map, size);
     close(fd);
+    return result;
+}
 
-    return !g_copyDone ? "copytimeout" : g_copyReady ? "ready" : "copyfailed";
+// Copy the frame into a gbm dmabuf (the path real XDPH/PipeWire uses). Returns ready[-black|-nonblack],
+// copyfailed or copytimeout. Reads the first pixel back by mapping the linear bo.
+static const char* copyFrameDmabuf(struct wl_display* display, struct hyprland_toplevel_export_frame_v1* frame) {
+    if (!g_gbm || !g_dmabuf || g_dmabufW == 0)
+        return "copyfailed";
+
+    // LINEAR so we can map it for readback, and RENDERING so the compositor can import+render to it.
+    struct gbm_bo* bo = gbm_bo_create(g_gbm, g_dmabufW, g_dmabufH, g_dmabufFormat, GBM_BO_USE_RENDERING | GBM_BO_USE_LINEAR);
+    if (!bo)
+        return "copyfailed";
+
+    const int                          fd       = gbm_bo_get_fd(bo);
+    const uint32_t                     stride   = gbm_bo_get_stride(bo);
+    const uint64_t                     modifier = gbm_bo_get_modifier(bo);
+
+    struct zwp_linux_buffer_params_v1* params = zwp_linux_dmabuf_v1_create_params(g_dmabuf);
+    zwp_linux_buffer_params_v1_add_listener(params, &PARAMS_LISTENER, NULL);
+    zwp_linux_buffer_params_v1_add(params, fd, 0, 0, stride, (uint32_t)(modifier >> 32), (uint32_t)(modifier & 0xFFFFFFFF));
+
+    g_paramBuffer            = NULL;
+    struct wl_buffer* buffer = zwp_linux_buffer_params_v1_create_immed(params, (int32_t)g_dmabufW, (int32_t)g_dmabufH, g_dmabufFormat, 0);
+
+    g_copyDone = g_copyReady = false;
+    hyprland_toplevel_export_frame_v1_copy(frame, buffer, 1);
+    wl_display_flush(display);
+    waitFor(display, &g_copyDone, 2000);
+
+    const char* result = "copyfailed";
+    if (!g_copyDone)
+        result = "copytimeout";
+    else if (g_copyReady) {
+        void*    mapData   = NULL;
+        uint32_t mapStride = 0;
+        void*    handle    = NULL;
+        uint8_t* px        = gbm_bo_map(bo, 0, 0, 1, 1, GBM_BO_TRANSFER_READ, &mapStride, &handle);
+        result             = (px && px != MAP_FAILED && firstPixelBlack(px)) ? "ready-black" : "ready-nonblack";
+        if (px && px != MAP_FAILED)
+            gbm_bo_unmap(bo, handle);
+        (void)mapData;
+    }
+
+    wl_buffer_destroy(buffer);
+    zwp_linux_buffer_params_v1_destroy(params);
+    close(fd);
+    gbm_bo_destroy(bo);
+    return result;
 }
 
 static int usage(const char* argv0) {
-    fprintf(stderr, "usage: %s (--handle <n> | --app-id <id>) [--count <n>] [--interval-ms <ms>] [--hold | --copy] [--xdph]\n", argv0);
+    fprintf(stderr,
+            "usage: %s (--handle <n> | --app-id <id>) [--count <n>] [--interval-ms <ms>]\n"
+            "          [--hold | --copy | --copy-dmabuf] [--xdph] [--drm-node <path>]\n",
+            argv0);
     return 2;
 }
 
@@ -241,7 +328,9 @@ int main(int argc, char** argv) {
     long        intervalMs = 100;
     bool        hold       = false;
     bool        copy       = false;
+    bool        copyDmabuf = false;
     bool        xdph       = false;
+    const char* drmNode    = NULL;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--handle") == 0 && i + 1 < argc)
@@ -256,14 +345,28 @@ int main(int argc, char** argv) {
             hold = true;
         else if (strcmp(argv[i], "--copy") == 0)
             copy = true;
+        else if (strcmp(argv[i], "--copy-dmabuf") == 0)
+            copyDmabuf = true;
         else if (strcmp(argv[i], "--xdph") == 0)
             xdph = true;
+        else if (strcmp(argv[i], "--drm-node") == 0 && i + 1 < argc)
+            drmNode = argv[++i];
         else
             return usage(argv[0]);
     }
 
     if ((handle < 0) == (appID == NULL))
         return usage(argv[0]);
+
+    int gbmFd = -1;
+    if (copyDmabuf) {
+        const char* node = drmNode ? drmNode : "/dev/dri/renderD128";
+        gbmFd            = open(node, O_RDWR | O_CLOEXEC);
+        if (gbmFd < 0 || !(g_gbm = gbm_create_device(gbmFd))) {
+            fprintf(stderr, "cannot open gbm device %s\n", node);
+            return 1;
+        }
+    }
 
     struct wl_display* display = wl_display_connect(NULL);
     if (!display) {
@@ -322,8 +425,10 @@ int main(int argc, char** argv) {
             printf("frame %ld none\n", n);
         else if (g_failed)
             printf("frame %ld failed\n", n);
+        else if (copyDmabuf)
+            printf("frame %ld %ux%u %s\n", n, g_width, g_height, copyFrameDmabuf(display, frame));
         else if (copy && g_shm)
-            printf("frame %ld %ux%u %s\n", n, g_width, g_height, copyFrame(display, frame));
+            printf("frame %ld %ux%u %s\n", n, g_width, g_height, copyFrameShm(display, frame));
         else
             printf("frame %ld %ux%u\n", n, g_width, g_height);
         fflush(stdout);
@@ -336,14 +441,35 @@ int main(int argc, char** argv) {
             }
         }
 
+        // Destroying the frame: if the server answered (buffer_done or failed) the resource exists and
+        // a destroy REQUEST is correct — this is exactly the sequence (destroy after a null-window
+        // request) that crashed the portal before the plugin always created the resource. Only when
+        // nothing came back ("none", no resource) must we destroy the proxy locally.
         if (g_frameDone)
             hyprland_toplevel_export_frame_v1_destroy(frame);
         else
-            wl_proxy_destroy((struct wl_proxy*)frame); // the server never created it: a destroy request would be a protocol error
+            wl_proxy_destroy((struct wl_proxy*)frame);
         wl_display_flush(display);
+
+        // Catch a protocol kill (e.g. invalid object) as soon as it happens.
+        if (wl_display_get_error(display) != 0) {
+            printf("display-error %d\n", wl_display_get_error(display));
+            fflush(stdout);
+            return 3;
+        }
         sleepMs(intervalMs);
     }
 
+    // Final roundtrip so any late protocol error from our last destroys surfaces before we report OK.
+    wl_display_roundtrip(display);
+    const int err = wl_display_get_error(display);
+    printf("%s\n", err == 0 ? "display-ok" : "display-error");
+    fflush(stdout);
+
     wl_display_disconnect(display);
-    return 0;
+    if (g_gbm)
+        gbm_device_destroy(g_gbm);
+    if (gbmFd >= 0)
+        close(gbmFd);
+    return err == 0 ? 0 : 3;
 }

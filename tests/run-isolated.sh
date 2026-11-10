@@ -32,6 +32,8 @@ TERM_BIN="${TERM_BIN:-/usr/bin/foot}"
 NEST_WAYLAND="${NEST_WAYLAND:-}"
 # Extra library dir for the compositor only (e.g. the host's exact libhyprutils inside a container).
 HYPRLAND_LIBRARY_PATH="${HYPRLAND_LIBRARY_PATH:-}"
+# DRM render node for the dmabuf copy probe (should match what the compositor renders on).
+DRM_NODE="${DRM_NODE:-/dev/dri/renderD128}"
 
 [[ -x "$PROBE" ]] || { echo "build the probe first: make -C $HERE"; exit 2; }
 [[ -f "$PLUGIN" ]] || { echo "no plugin at $PLUGIN"; exit 2; }
@@ -84,6 +86,10 @@ pass() { PASSES=$((PASSES + 1)); echo "PASS: $*"; }
 fail() { FAILS=$((FAILS + 1)); echo "FAIL: $*"; }
 expect_eq() { # what expected actual
     if [[ "$2" == "$3" ]]; then pass "$1 ($3)"; else fail "$1: expected '$2', got '$3'"; fi
+}
+expect_match() { # what glob actual
+    # shellcheck disable=SC2053
+    if [[ "$3" == $2 ]]; then pass "$1 ($3)"; else fail "$1: expected match '$2', got '$3'"; fi
 }
 
 # --- compositor -------------------------------------------------------------------------------
@@ -173,7 +179,7 @@ sleep 1
 
 expect_eq "p1 captures A before any redirect" "$SIZE_A" "$(last_size p1)"
 expect_eq "p3 (uint handle) captures A" "$SIZE_A" "$(last_size p3)"
-expect_eq "cp copies A" "$SIZE_A ready" "$(tail -1 "$T/logs/cp.out" | cut -d' ' -f3-)"
+expect_match "cp copies A (shm)" "$SIZE_A ready*" "$(tail -1 "$T/logs/cp.out" | cut -d' ' -f3-)"
 expect_eq "sharestatus sees one active capture per client" "4" "$(status | jq '[.captures[] | select(.active)] | length')"
 expect_eq "A tagged while shared" "screenshared" "$(tags_of hsA)"
 expect_eq "border rule colors A" "ffff3030 0deg" "$(border_of hsA)"
@@ -185,7 +191,7 @@ expect_eq "p1 now sees B" "$SIZE_B" "$(last_size p1)"
 expect_eq "p2 (second session, same origin) follows" "$SIZE_B" "$(last_size p2)"
 expect_eq "p3 follows" "$SIZE_B" "$(last_size p3)"
 sleep 0.3
-expect_eq "cp copies B's pixels into a B-sized buffer" "$SIZE_B ready" "$(tail -1 "$T/logs/cp.out" | cut -d' ' -f3-)"
+expect_match "cp copies B's pixels into a B-sized buffer" "$SIZE_B ready*" "$(tail -1 "$T/logs/cp.out" | cut -d' ' -f3-)"
 kill "$PID_cp" 2>/dev/null
 expect_eq "tag moved to B" "screenshared" "$(tags_of hsB)"
 sleep 1.2
@@ -194,7 +200,16 @@ expect_eq "sharestatus target is B" "$B" "$(status | jq -r '.target.address')"
 # Fields read through the plugin's view of CWindow / wl_client: garbage here would mean an ABI mismatch.
 expect_eq "sharestatus reads CWindow::m_class (layout sanity)" "hsB" "$(status | jq -r '.target.class')"
 expect_eq "sharestatus reports the probe's pid" "$PID_p1" "$(status | jq -r --argjson pid "$PID_p1" '.captures[] | select(.pid == $pid) | .pid')"
-expect_eq "sharestatus served is B" "$B" "$(status | jq -r '[.captures[].served.address] | unique | join(",")')"
+expect_eq "sharestatus served is B, state target" "$B|target" "$(status | jq -r '[.captures[] | "\(.served.address)|\(.state)"] | unique | join(",")')"
+
+capture_field() { # probe-name jq-field
+    local pid
+    pid="$(eval echo "\$PID_$1")"
+    status | jq -r --argjson pid "$pid" "[.captures[] | select(.pid == \$pid)][0].$2"
+}
+failed_count() { grep -c ' failed$' "$T/logs/$1.out"; }
+# kitty sets its class a moment after mapping, so the float/size rules land late: give them time.
+wait_mapped() { for _ in $(seq 100); do [[ -n "$(addr_of "$1")" ]] && break; sleep 0.1; done; sleep 1; }
 
 # --- Lua function, via the same Lua state binds use ----------------------------------------------
 expect_eq "hl.plugin.hyprshare.share(address:A) via eval" "ok" "$(ctl eval "assert(hl.plugin.hyprshare.share('address:$A'))" | tail -1)"
@@ -204,123 +219,112 @@ expect_eq "bad selector returns false, err (no raise)" "ok" "$(ctl eval "local o
 ctl reload >/dev/null
 sleep 1
 expect_eq "Lua functions survive a config reload" "ok" "$(ctl eval "assert(hl.plugin.hyprshare and hl.plugin.hyprshare.status():find('captures'))" | tail -1)"
-expect_eq "status() returns JSON" "ok" "$(ctl eval "assert(hl.plugin.hyprshare.status():find('captures'))" | tail -1)"
 
-# --- clear ------------------------------------------------------------------------------------
+# --- clear = back to the originally picked window (origin still alive) ----------------------------
 ctl sharewindow "address:$B" >/dev/null
 sleep 0.6
 expect_eq "shareclear" "ok" "$(ctl shareclear)"
 sleep 0.6
 expect_eq "after clear p1 is back on A" "$SIZE_A" "$(last_size p1)"
-expect_eq "after clear: no redirects" "0" "$(status | jq '.redirectedOrigins | length')"
+expect_eq "after clear: state origin, target null" "origin|null" "$(status | jq -r "[.captures[] | select(.pid == $PID_p1)][0].state")|$(status | jq -r '.target')"
 sleep 1.2
 expect_eq "after clear: tag back on A only" "screenshared|" "$(tags_of hsA)|$(tags_of hsB)"
 
-# --- target closes -> fall back to the origin ------------------------------------------------------
+# --- PRIVACY: target closed does NOT reveal the picked window; capture goes to NOTHING ------------
+# dcp/scp are copy probes for hsA so the placeholder's actual pixels can be read back; they follow
+# the redirect like any other capture.
+start_probe dcp --xdph --app-id hsA --copy-dmabuf --drm-node "$DRM_NODE" --interval-ms 100
+start_probe scp --xdph --app-id hsA --copy --interval-ms 100
+sleep 1
 ctl sharewindow "address:$B" >/dev/null
-sleep 0.6
+sleep 0.8
 expect_eq "redirected to B again" "$SIZE_B" "$(last_size p1)"
+expect_match "dcp copies the live target B (dmabuf)" "$SIZE_B ready*" "$(grep -E '^frame ' "$T/logs/dcp.out" | tail -1 | cut -d' ' -f3-)"
 kill "$PID_hsB"
-sleep 1.5
-expect_eq "target B closed: p1 falls back to A" "$SIZE_A" "$(last_size p1)"
-expect_eq "target B closed: redirects dropped" "0" "$(status | jq '.redirectedOrigins | length')"
-expect_eq "compositor alive" "0" "$(kill -0 "$COMPOSITOR_PID" 2>/dev/null; echo $?)"
+sleep 2
+expect_eq "target B closed: p1 is NOT back on A" "true" "$([[ "$(last_size p1)" != "$SIZE_A" ]] && echo true || echo false)"
+expect_eq "target B closed: p1 served the placeholder at B's last size" "$SIZE_B" "$(last_size p1)"
+expect_eq "target B closed: capture state is nothing" "nothing" "$(capture_field p1 state)"
+expect_eq "target B closed: served is null (nobody)" "false" "$(capture_field p1 'served.alive')"
+expect_eq "target B closed: tag on nobody (A untagged)" "" "$(tags_of hsA)"
+expect_eq "target B closed: compositor alive" "0" "$(kill -0 "$COMPOSITOR_PID" 2>/dev/null; echo $?)"
 
-# --- origin closes while redirected -> keep serving the target -------------------------------------
+# Placeholder pixels are black, via a REAL dmabuf copy (the path XDPH/PipeWire uses) and via shm.
+sleep 0.5
+expect_match "placeholder dmabuf copy reads back black at B's size" "$SIZE_B ready-black" "$(grep -E '^frame ' "$T/logs/dcp.out" | tail -1 | cut -d' ' -f3-)"
+expect_match "placeholder shm copy reads back black at B's size" "$SIZE_B ready-black" "$(grep -E '^frame ' "$T/logs/scp.out" | tail -1 | cut -d' ' -f3-)"
+
+# A new window appearing while in NOTHING (its address may even reuse B's) must NOT be revealed.
 spawn_window hsC
-for _ in $(seq 100); do [[ -n "$(addr_of hsC)" ]] && break; sleep 0.1; done
-sleep 0.3
+wait_mapped hsC
 C="$(addr_of hsC)"; SIZE_C="$(size_of hsC)"
-expect_eq "sharewindow class:hsC (regex selector)" "ok" "$(ctl sharewindow class:hsC)"
 sleep 0.6
-expect_eq "redirected to C" "$SIZE_C" "$(last_size p1)"
-kill "$PID_hsA"
-sleep 1.5
-expect_eq "origin A closed: p1 (wlr handle) still sees C" "$SIZE_C" "$(last_size p1)"
-expect_eq "origin A closed: p2 still sees C" "$SIZE_C" "$(last_size p2)"
-expect_eq "origin A closed: p3 (uint handle, resolves to nothing now) still sees C" "$SIZE_C" "$(last_size p3)"
+expect_eq "new window while NOTHING: p1 still placeholder (state nothing)" "nothing" "$(capture_field p1 state)"
+expect_eq "new window while NOTHING: p1 still at B's size, not C" "$SIZE_B" "$(last_size p1)"
+
+# Destroying frame proxies mid-placeholder, every iteration, posts no protocol error.
+start_probe tp --app-id hsA --copy-dmabuf --drm-node "$DRM_NODE" --count 8 --interval-ms 60
+wait "$PID_tp" 2>/dev/null
+expect_eq "placeholder: proxies destroyed each iteration, no protocol error" "display-ok" "$(tail -1 "$T/logs/tp.out")"
+
+# Explicit share resumes it: p1 (in NOTHING) now follows the new target C.
+kill "$PID_dcp" "$PID_scp" 2>/dev/null
+expect_eq "sharewindow class:hsC resumes the NOTHING capture" "ok" "$(ctl sharewindow class:hsC)"
+sleep 0.8
+expect_eq "p1 resumes on C after explicit share" "$SIZE_C" "$(last_size p1)"
 expect_eq "C tagged" "screenshared" "$(tags_of hsC)"
 
-# --- a frame held open (waiting for damage) keeps the capture active -------------------------------
-start_probe hold --app-id hsC --hold
-sleep 2
-expect_eq "held frame: capture still active after 2s" "true" "$(status | jq -r --argjson pid "$PID_hold" '[.captures[] | select(.pid == $pid)][0] | "\(.active)"')"
-expect_eq "held frame: outstandingFrames" "1" "$(status | jq -r --argjson pid "$PID_hold" '[.captures[] | select(.pid == $pid)][0].outstandingFrames')"
-
-# --- the served window closes with nothing redirected -> held, and sharewindow can still move it ---
-# Without holding, the compositor drops the request (no frame object at all), the portal waits for
-# it forever, the capture goes inactive and sharewindow has nothing left to redirect.
-kill "$PID_p2" "$PID_p3" "$PID_hold" 2>/dev/null
-failed_count() { grep -c ' failed$' "$T/logs/$1.out"; }
-capture_field() { # probe-name jq-field
-    local pid
-    pid="$(eval echo "\$PID_$1")"
-    status | jq -r --argjson pid "$pid" "[.captures[] | select(.pid == \$pid)][0].$2"
-}
-# kitty sets its class a moment after mapping, so the float/size rules land late: give them time.
-wait_mapped() { for _ in $(seq 100); do [[ -n "$(addr_of "$1")" ]] && break; sleep 0.1; done; sleep 1; }
-
+# --- origin closed while UNREDIRECTED -> NOTHING -> explicit share resumes ------------------------
 spawn_window hsD
 spawn_window hsE
 wait_mapped hsD
 wait_mapped hsE
 SIZE_D="$(size_of hsD)"; SIZE_E="$(size_of hsE)"
-echo "D=$(addr_of hsD) ($SIZE_D)  E=$(addr_of hsE) ($SIZE_E)  C=$C ($SIZE_C)"
-expect_eq "shareclear before the held scenarios" "ok" "$(ctl shareclear)"
-start_probe x1 --xdph --app-id hsD --interval-ms 50
+echo "C=$C ($SIZE_C)  D=$(addr_of hsD) ($SIZE_D)  E=$(addr_of hsE) ($SIZE_E)"
+start_probe xD --xdph --app-id hsD --interval-ms 60   # its own capture, FOLLOW_ORIGIN
 sleep 1
-expect_eq "x1 (XDPH-like) captures D" "$SIZE_D" "$(last_size x1)"
-
+expect_eq "xD captures its picked window D" "$SIZE_D" "$(last_size xD)"
 kill "$PID_hsD"
 sleep 2
-expect_eq "D closed, nothing redirected: x1 gets no failed (keeps its last frame)" "0" "$(failed_count x1)"
-expect_eq "D closed: x1 still shows D's last frame" "$SIZE_D" "$(last_size x1)"
-expect_eq "D closed: capture stays active" "true" "$(capture_field x1 active)"
-expect_eq "D closed: one held frame" "1" "$(capture_field x1 heldFrames)"
-expect_eq "sharewindow moves the held share to E" "ok" "$(ctl sharewindow class:hsE)"
-sleep 0.6
-expect_eq "held frame released with exactly one failed" "1" "$(failed_count x1)"
-expect_eq "x1 re-requested and now captures E" "$SIZE_E" "$(last_size x1)"
-expect_eq "no held frames left" "0" "$(capture_field x1 heldFrames)"
-expect_eq "E tagged" "screenshared" "$(tags_of hsE)"
+expect_eq "origin D closed (unredirected): xD state nothing" "nothing" "$(capture_field xD state)"
+expect_eq "origin D closed: xD served placeholder at D's last size" "$SIZE_D" "$(last_size xD)"
+expect_eq "origin D closed: capture stays active" "true" "$(capture_field xD active)"
+expect_eq "sharewindow E resumes xD" "ok" "$(ctl sharewindow class:hsE)"
+sleep 0.8
+expect_eq "xD resumes on E" "$SIZE_E" "$(last_size xD)"
 
-# --- origin dead AND the target closes -> held -> sharewindow C resumes it ---
-kill "$PID_hsE"
-sleep 2
-expect_eq "D dead + E closed: still exactly one failed" "1" "$(failed_count x1)"
-expect_eq "D dead + E closed: held" "1" "$(capture_field x1 heldFrames)"
-expect_eq "D dead + E closed: capture stays active" "true" "$(capture_field x1 active)"
-expect_eq "sharewindow C" "ok" "$(ctl sharewindow class:hsC)"
-sleep 0.6
-expect_eq "released again: second failed" "2" "$(failed_count x1)"
-expect_eq "x1 resumes on C" "$(size_of hsC)" "$(last_size x1)"
-
-# --- a held frame at unload gets failed too ---
-spawn_window hsF
-wait_mapped hsF
-start_probe x2 --xdph --app-id hsF --interval-ms 50
-sleep 1
-expect_eq "x2 captures F" "$(size_of hsF)" "$(last_size x2)"
-kill "$PID_hsF"
-sleep 1.5
-expect_eq "F closed (x2's own capture, not redirected): held" "1" "$(capture_field x2 heldFrames)"
+# --- the null-window -> destroy sequence that crashed the portal, from an UNTRACKED client --------
+# A client that only ever captures a dead handle: the original would never create the resource, and
+# the destroy would hit a NULL object (wl_display error 0). The plugin creates+fails the resource.
+start_probe nullp --handle 0xdead --copy --count 6 --interval-ms 60
+wait "$PID_nullp" 2>/dev/null
+expect_eq "untracked dead handle: every frame failed (resource created)" "6" "$(failed_count nullp)"
+expect_eq "untracked dead handle: destroy posts no protocol error" "display-ok" "$(tail -1 "$T/logs/nullp.out")"
+expect_eq "compositor alive after the crash-repro" "0" "$(kill -0 "$COMPOSITOR_PID" 2>/dev/null; echo $?)"
 
 status >"$T/logs/status.json"
 
+# --- unload with a pending placeholder -----------------------------------------------------------
+# xF captures hsE, then hsE dies -> xF enters NOTHING and is serving placeholders when we unload.
+start_probe xF --xdph --app-id hsE --copy-dmabuf --drm-node "$DRM_NODE" --interval-ms 80
+sleep 1
+kill "$PID_hsE"
+sleep 1.5
+expect_eq "xF now in NOTHING (placeholder) before unload" "nothing" "$(capture_field xF state)"
+
 # --- unload -----------------------------------------------------------------------------------
-expect_eq "plugin unload" "ok" "$(ctl plugin unload "$PLUGIN" | tail -1)"
+expect_eq "plugin unload (with a placeholder pending)" "ok" "$(ctl plugin unload "$PLUGIN" | tail -1)"
 sleep 0.5
 expect_eq "tag removed on unload" "" "$(tags_of hsC)"
-expect_eq "held frame got failed on unload" "failed" "$(tail -1 "$T/logs/x2.out" | awk '{print $3}')"
 expect_eq "sharestatus gone after unload" "unknown request" "$(ctl sharestatus)"
 sleep 0.5
 expect_eq "compositor alive after unload" "0" "$(kill -0 "$COMPOSITOR_PID" 2>/dev/null; echo $?)"
-
-# Without the plugin, p1's request for the dead origin is served by the stock path again (the
-# compositor rejects it, so the probe reports "none"): proves the hook really came out.
-sleep 2.5
-P1_AFTER="$(last_size p1)"
-if [[ "$P1_AFTER" != "$SIZE_C" ]]; then pass "after unload p1 no longer redirected ($P1_AFTER)"; else fail "after unload p1 still sees C"; fi
+# xF was mid-placeholder at unload; the plugin disowns (not destroys) its frame resource, so the
+# client sees no "invalid object" protocol kill — the exact crash this round fixes.
+sleep 1
+kill "$PID_xF" 2>/dev/null
+wait "$PID_xF" 2>/dev/null
+expect_eq "xF survived unload with no protocol error" "0" "$(grep -c 'invalid object' "$T/logs/xF.err")"
 
 grep -i "hyprshare\|captureToplevel\|Couldn't capture" "$T/run/hypr/$HIS/hyprland.log" 2>/dev/null | tail -10 > "$T/logs/plugin-lines.log"
 
