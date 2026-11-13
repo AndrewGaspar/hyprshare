@@ -51,10 +51,10 @@ CPPFLAGS += $(HYPRLAND_DEFINES) \
 LDFLAGS += -shared -Wl,-z,nodelete
 LDLIBS += $(shell pkg-config --libs lua wayland-server)
 
-SRC = src/main.cpp src/ShareRedirector.cpp src/Glyph.cpp
+SRC = src/main.cpp src/ShareRedirector.cpp src/Glyph.cpp src/CaptureSessions.cpp src/ChangeEvent.cpp
 OBJ = $(SRC:src/%.cpp=build/%.o)
 # Versioned file name: Hyprland dlopens by path, so never overwrite a .so a live session has loaded.
-TARGET = build/hyprshare-v4.so
+TARGET = build/hyprshare-v5.so
 
 all: $(TARGET)
 

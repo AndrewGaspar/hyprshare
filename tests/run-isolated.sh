@@ -23,7 +23,7 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(dirname "$HERE")"
-PLUGIN="$(realpath "${1:-$ROOT/build/hyprshare-v4.so}")"
+PLUGIN="$(realpath "${1:-$ROOT/build/hyprshare-v5.so}")"
 HYPRLAND_BIN="${HYPRLAND_BIN:-/usr/lib/hypxrland/Hyprland}"
 HYPRCTL_BIN="${HYPRCTL_BIN:-/usr/lib/hypxrland/hyprctl}"
 PROBE="$HERE/build/capture-probe"
@@ -178,9 +178,9 @@ start_probe() { # name args...
 last_size() { tail -1 "$T/logs/$1.out" | awk '{print $3}'; }
 status() { ctl sharestatus; }
 
-if [[ "${SUITE:-share}" == glyph ]]; then
+if [[ "${SUITE:-share}" == glyph || "${SUITE:-share}" == bar ]]; then
     # shellcheck source=glyph-suite.sh
-    source "$HERE/glyph-suite.sh"
+    source "$HERE/$SUITE-suite.sh"
     ctl rollinglog >"$T/logs/rolling.log" 2>/dev/null
     echo
     echo "$PASSES passed, $FAILS failed"

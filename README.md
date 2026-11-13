@@ -51,12 +51,12 @@ from** — not `/usr/include/hyprland`, which belongs to stock hyprland with dif
 ```sh
 # 1. Headers tree: detached worktree at the running commit, configured like the hypxrland
 #    PKGBUILD (Release, WITH_OPENXR, the package's version stamp), protocol headers generated.
-#    (For the r468 package, pass its cosmetic stamp too so version.h is byte-identical.)
-GIT_TAG=v0.56.2-468-g9648898995 GIT_COMMITS=8129 GIT_COMMIT_DATE=2026-11-05 scripts/prepare-headers.sh
+#    (For the r469 package, 7ac272db9, pass its cosmetic stamp too so version.h is byte-identical.)
+GIT_TAG=v0.56.2-469-g7ac272db9a GIT_COMMITS=8130 GIT_COMMIT_DATE=2026-11-11 scripts/prepare-headers.sh
 
 # 2. Plugin and the test probe
-make              # -> build/hyprshare-v4.so (versioned: never overwrite a .so a session has loaded)
-make -C tests     # -> tests/build/{capture-probe,click-logger,vpointer}
+make              # -> build/hyprshare-v5.so (versioned: never overwrite a .so a session has loaded)
+make -C tests     # -> tests/build/{capture-probe,output-probe,click-logger,vpointer}
 make hash         # shows the tree's commit next to the running compositor's
 ```
 
@@ -76,12 +76,12 @@ the image mapped makes those inert instead of dangling.
 ## Load / unload (live session)
 
 ```sh
-hyprctl plugin load   /home/ajg/code/hyprshare/build/hyprshare-v4.so
-hyprctl plugin unload /home/ajg/code/hyprshare/build/hyprshare-v4.so
+hyprctl plugin load   /home/ajg/code/hyprshare/build/hyprshare-v5.so
+hyprctl plugin unload /home/ajg/code/hyprshare/build/hyprshare-v5.so
 hyprctl plugin list
 ```
 
-Unloading removes the hook, the hyprctl commands, the Lua functions, the glyph decorations, the
+Unloading removes the hooks, the hyprctl commands, the Lua functions, the glyph decorations, the
 frame/client/input listeners and the timer, removes the `screenshared` / `screenshare-mode` tags,
 and answers any pending placeholder frame; it **disowns**
 (does not destroy) the placeholder frame resources, so the portal client sees no protocol error.
@@ -90,8 +90,8 @@ Hyprland `dlopen`s by path, so each build has its own file name. Upgrade by unlo
 and loading the new one, e.g.:
 
 ```sh
-hyprctl plugin unload /home/ajg/code/hyprshare/build/hyprshare-v3.so
-hyprctl plugin load   /home/ajg/code/hyprshare/build/hyprshare-v4.so
+hyprctl plugin unload /home/ajg/code/hyprshare/build/hyprshare-v4.so
+hyprctl plugin load   /home/ajg/code/hyprshare/build/hyprshare-v5.so
 ```
 
 ## Use
@@ -104,8 +104,14 @@ hyprctl sharewindow address:0x55d1...   # ... or to a selected window
 hyprctl sharewindow class:firefox
 hyprctl shareclear                      # back to the windows picked in the portal
 hyprctl sharepause                      # pause: every active share shows the black placeholder
+hyprctl sharefocus                      # focus the window the share is showing   -> ok
+hyprctl sharestop                       # end ALL screen capturing now            -> ok <n>
 hyprctl sharestatus                     # JSON, see below
 ```
+
+Replies are `ok` or an error string; `sharestop` replies `ok <n>`, the number of compositor capture
+sessions it stopped. `sharefocus` errors: `no window share` (no active window share at all),
+`shared window is gone` (the shared window closed — the share is showing the black placeholder).
 
 Selectors are the compositor's own window selectors (`Desktop::CViewQuery::selector`):
 `active`, `address:0x…`, `class:<regex>`, `title:<regex>`, `initialclass:`, `initialtitle:`,
@@ -115,12 +121,14 @@ Under the **Lua** config, `hyprctl dispatch X` is evaluated as `hl.dispatch(X)`,
 dispatchers registered by name are *not* reachable through it — use the `hyprctl` commands above,
 or `hyprctl eval 'hl.plugin.hyprshare.share("address:0x…")'`. Under a hyprlang `.conf` the
 dispatchers `sharewindow` / `shareclear` / `sharepause` exist too (`hyprctl dispatch sharewindow …`,
-`bind = SUPER CTRL ALT, S, sharewindow`) — that path is registered but was not tested.
+`bind = SUPER CTRL ALT, S, sharewindow`), as do `sharefocus` and `sharestop` — that path is registered
+but was not tested.
 
 ### Lua binds
 
-The plugin registers `hl.plugin.hyprshare.share([selector])`, `.clear()`, `.pause()` and `.status()`. They act
-immediately and return `true` or `false, err` (they never raise). Wrap them in a function so the
+The plugin registers `hl.plugin.hyprshare.share([selector])`, `.clear()`, `.pause()`, `.focus()`,
+`.stop()` and `.status()`. They act immediately and return `true` or `false, err` (they never raise);
+`.stop()` returns `true, n` (sessions stopped) and `.status()` the `sharestatus` JSON string. Wrap them in a function so the
 config still parses before the plugin is loaded:
 
 ```lua
@@ -128,6 +136,8 @@ config still parses before the plugin is loaded:
 hl.bind("SUPER + CTRL + ALT + S", function() hl.plugin.hyprshare.share() end)
 hl.bind("SUPER + CTRL + ALT + SHIFT + S", function() hl.plugin.hyprshare.clear() end)
 hl.bind("SUPER + CTRL + ALT + P", function() hl.plugin.hyprshare.pause() end)
+hl.bind("SUPER + CTRL + ALT + F", function() hl.plugin.hyprshare.focus() end)
+hl.bind("SUPER + CTRL + ALT + X", function() hl.plugin.hyprshare.stop() end)
 ```
 
 Pressing them without the plugin loaded is a harmless Lua error (`hl.plugin.hyprshare` is nil).
@@ -222,23 +232,99 @@ hl.window_rule({ name = "hyprshare-border",   match = { tag = "screenshared" }, 
 ```json
 {
   "shareMode": true,
-  "target": {"address": "0x55df55a73ca0", "alive": true, "mapped": true, "class": "hsC", "title": "sh"},
+  "capturing": true,
+  "anyShare": true,
+  "sharedWindow": {"state": "live", "address": "0x5643af87d880", "alive": true, "class": "hsB", "title": "sh", "workspace": "1"},
+  "target": {"address": "0x5643af87d880", "alive": true, "mapped": true, "class": "hsB", "title": "sh"},
   "paused": null,
   "captures": [
-    {"pid": 246, "active": true, "state": "target", "nothingReason": "", "lastSeenMsAgo": 25,
-     "outstandingFrames": 0, "placeholderFrames": 0, "origin": {"address": "0x55df55847710", "alive": false},
-     "served": {"address": "0x55df55a73ca0", "alive": true, "mapped": true, "class": "hsC", "title": "sh"}}
+    {"pid": 334, "active": true, "state": "target", "nothingReason": "", "lastSeenMsAgo": 43, "outstandingFrames": 0, "placeholderFrames": 0,
+     "origin": {"address": "0x5643afaad1a0", "alive": true, "mapped": true, "class": "hsA", "title": "sh"},
+     "served": {"address": "0x5643af87d880", "alive": true, "mapped": true, "class": "hsB", "title": "sh"}}
   ],
+  "sessions": [
+    {"type": "region", "sharing": false, "pid": -1, "clientAlive": false, "monitor": "HEADLESS-1", "window": ""},
+    {"type": "window", "sharing": false, "pid": 334, "clientAlive": true, "monitor": "HEADLESS-1", "window": "0x5643afaad1a0"},
+    {"type": "window", "sharing": true, "pid": 334, "clientAlive": true, "monitor": "HEADLESS-1", "window": "0x5643af87d880"},
+    {"type": "monitor", "sharing": true, "pid": 369, "clientAlive": true, "monitor": "HEADLESS-1", "window": ""}
+  ],
+  "stopGrace": {"active": false, "msLeft": 0, "pids": []},
   "glyph": {"corner": "top_right", "visibility": "all",
-            "glyphs": [{"address": "0x55df55a73ca0", "state": "live", "box": [1176, 110, 14, 14]}]}
+            "glyphs": [{"address": "0x5643af87d880", "state": "live", "box": [1116, 10, 14, 14]}]}
 }
 ```
 
-`state` is `origin`, `target` or `nothing` (serving a placeholder); `served` is null in `nothing`,
-and `nothingReason` says why (`paused` or `closed`). `paused` is the window a pause will resume.
-`glyph.glyphs` lists the glyphs currently drawn, with their hit boxes in global layout coordinates.
-`pid` is the capturing client (XDPH in real use, not the app). Inactive captures are forgotten
-after 10 s.
+- `shareMode`: any hyprshare window capture is active (in any state, including paused / placeholder).
+- `capturing`: any compositor capture session is sharing right now — monitor, region or window, over
+  any protocol (wlr-screencopy clients such as wf-recorder or a portal's monitor share,
+  ext-image-copy-capture, toplevel export), whether or not hyprshare redirects it. It is the
+  session's own sharing flag, the exact thing the built-in `screencast` / `screencastv2` events
+  report: on with the first copied frame, off ~500 ms after the last one or on stop.
+- `anyShare` = `capturing || shareMode`. A paused (or closed-window) window share only sends black
+  placeholder frames, which the compositor does not count as sharing, so `capturing` goes false
+  ~500 ms into a pause while the stream is still live; `anyShare` stays true.
+- `sharedWindow`: `null` when no window share is active. Otherwise the window the most recently
+  started / retargeted active capture shows (after a `sharewindow` all active captures show the same
+  window), with `state`:
+  - `live`: being shared; `address` / `class` / `title` / `workspace` describe it, `alive` true;
+  - `paused`: paused; the fields describe the window a resume returns to (`alive` false if it closed);
+  - `closed`: the shared window closed, the share shows the placeholder; `address` is `""`.
+
+  Every key is always present (`""` / `false` when there is no window). `sharefocus` succeeds exactly
+  when `sharedWindow.alive` is true (when paused it focuses the paused window).
+- `sessions`: every live (not stopped) compositor capture session. `pid` is the capturing client
+  (XDPH, wf-recorder, …), `monitor` the output it captures (for a window, the window's monitor),
+  `window` the captured window's address (window sessions only). The compositor keeps a
+  wlr-screencopy / toplevel-export session after its client disconnects (it never stops it); such a
+  leftover shows `clientAlive: false`, `pid: -1` and `sharing: false` until something stops it
+  (`sharestop` does). A redirected window share has one session per window it has served.
+- `stopGrace`: the post-`sharestop` refusal window: `pids` of the refused clients, `msLeft`.
+- `target`, `paused`, `captures`, `glyph`: unchanged from v4. `state` is `origin`, `target` or
+  `nothing` (serving a placeholder); `served` is null in `nothing`, and `nothingReason` says why
+  (`paused` or `closed`). `paused` is the window a pause will resume. `glyph.glyphs` lists the glyphs
+  currently drawn, with their hit boxes in global layout coordinates. `pid` is the capturing client
+  (XDPH in real use, not the app). Inactive captures are forgotten after 10 s.
+
+### For a status bar
+
+- **Listen** on socket2 for `hyprshare>>changed` and re-query `hyprctl sharestatus` (`hyprctl -j`
+  is not needed: it is always JSON). The plugin posts it whenever anything above that a bar cares
+  about changed: `capturing` on/off, a session added / removed / sharing flip, the share target
+  changing, pause/resume, a capture entering or leaving the placeholder state, the served window
+  closing or retitling, `sharestop`. It is coalesced: one check per event-loop iteration against the
+  last state posted, so a burst (or a change and its undo in one iteration) posts at most one event,
+  and a re-query always sees the change. The built-in `screencast` / `screencastv2` events still
+  fire too; listening to `hyprshare>>changed` alone is enough.
+- **Red bar** while anything captures: `.anyShare` (or `.capturing` for the compositor's strict view).
+- **Focus button** while window-sharing: show it when `.sharedWindow != null`; enable it when
+  `.sharedWindow.alive`; label it with `.sharedWindow.title` / `.class`; on click run
+  `hyprctl sharefocus` (or `hl.plugin.hyprshare.focus()`).
+- **Stop button** while `.anyShare`: first close the portal's sessions (XDPH `CloseAll`, so the
+  apps see the share end), then `hyprctl sharestop` for whatever is left (direct screencopy clients).
+
+### `sharestop`
+
+Compositor-side "end all capturing now":
+
+1. every frame that was given a buffer and is waiting for an output commit is answered `failed`
+   (otherwise a stopped session's frame is never answered and a client like wf-recorder hangs);
+2. every live capture session of every type is stopped (`screencast>>0` fires for the ones that
+   were sharing; ext-image-copy-capture clients are sent `stopped`; wlr-screencopy and toplevel
+   export sessions are torn down);
+3. the redirect forgets everything: captures, target, pause, placeholder state, `screenshared` /
+   `screenshare-mode` tags, glyphs;
+4. for `plugin:hyprshare:stop_grace_ms` (default `2000`, `0` disables, max `60000`) every client it
+   stopped is **refused**: its window-share requests get `failed` (after 100 ms, so a portal that
+   re-requests on `failed` is not spun in a tight loop), and any copy it requests over
+   wlr-screencopy, ext-image-copy-capture or toplevel export gets `failed` (the session it belongs to
+   is stopped too). Nothing is copied for a refused client. After the window a retry captures again
+   (that is why the portal's own sessions must be closed first).
+
+```lua
+if hl.plugin.hyprshare then
+    hl.config({ plugin = { hyprshare = { stop_grace_ms = 2000 } } })
+end
+```
 
 ## Tests
 
@@ -255,8 +341,8 @@ can only run nested; the container keeps that off the live display. `tests/run-i
 environment, private `XDG_RUNTIME_DIR`/`HOME`, `HYPRLAND_NO_SD_VARS=1`, the real `hyprctl` binary
 and PID-tracked cleanup.
 
-Two suites run, each against a fresh nested compositor: `share` (the redirect/placeholder suite)
-and `glyph`. `HYPRSHARE_SUITES=glyph tests/run-in-container.sh` runs one.
+Three suites run, each against a fresh nested compositor: `share` (the redirect/placeholder suite),
+`glyph` and `bar` (the status-bar API). `HYPRSHARE_SUITES=bar tests/run-in-container.sh` runs one.
 
 `tests/capture-probe` stands in for XDPH: a fresh capture request per frame, printing the
 advertised buffer size; `--app-id` uses XDPH's exact request
@@ -265,7 +351,10 @@ advertised buffer size; `--app-id` uses XDPH's exact request
 real XDPH/PipeWire path), both reading the first pixel back (`ready-black`/`ready-nonblack`);
 `--xdph` waits for frame events forever and re-requests after `failed` (patched XDPH). Every
 iteration it destroys the frame proxy and reports `display-ok` / `display-error` at the end;
-`--sample X Y` also prints the copied buffer's pixel there. `tests/click-logger` is a solid-colour
+`--sample X Y` also prints the copied buffer's pixel there. `tests/output-probe` captures the monitor
+like wf-recorder or a portal's monitor share: wlr-screencopy by default (`--region X Y W H` for a
+region), ext-image-copy-capture with `--ext`; it re-requests after `failed` (re-creating an ext
+session after `stopped`) unless `--exit-on-failed`. `tests/click-logger` is a solid-colour
 xdg-shell window that prints every pointer button it receives; `tests/vpointer` injects moves,
 clicks and drags through `zwlr_virtual_pointer_v1` (a real pointer device to the compositor);
 on-screen pixels are read with `grim`.
@@ -281,6 +370,22 @@ the tag on nobody; a new window appearing in **nothing** does not reveal it; `sh
 an origin closing while unredirected does the same. Crash-proofing: destroying frame proxies every
 iteration and the untracked null-handle → destroy sequence both post **no protocol error**; unload
 with a placeholder pending leaves the client unharmed; unload (tags gone, commands gone, hook out).
+
+Bar suite (87 checks): idle status (`capturing`/`anyShare` false, `sharedWindow` null, no sessions,
+`sharefocus` = `no window share`, no events while idle); a wlr-screencopy monitor capture and a
+region capture (`capturing`, `sessions` type/sharing/pid/monitor, `changed` and the built-in
+`screencast` events on start and ~500 ms after stop, a dead client's leftover session reported as
+`clientAlive: false` and not attributed to a later client reusing its address); an
+ext-image-copy-capture capture; a window share (`sharedWindow` live, window session, `changed` on
+start / retarget / pause / resume / served window closing, no events while a share is steady, a
+change and its undo in one hyprctl batch post none); `sharefocus` switching to the shared window's
+workspace and a special workspace, focusing the paused window, failing with `shared window is gone`
+after it closes (also via Lua `focus()`); `sharestop` with four clients at once (portal-style
+monitor share, ext-image-copy-capture, wf-recorder-style, XDPH-style window share): `ok <n>`, nothing
+sharing, the redirect cleared and untagged, every retry refused during the grace window (no frame
+copied, ext told `stopped`, window re-requests failed at a bounded rate, the wf-recorder-style client
+exits), every client captures again after it, no protocol errors; Lua `stop()` and a configured
+500 ms grace.
 
 Glyph suite (66 checks): no glyph without a share (and the screen shows window pixels there); LIVE
 and IDLE glyphs appear with a share, at the configured box, drawn on screen; the glyph is **not** in
@@ -314,12 +419,24 @@ glyphs visible → no crash, decorations gone, clicks reach the client, new wind
 - **The placeholder renders off the output-commit cycle** (from a throttle timer). This is a plugin
   reaching into the compositor's renderer; validated on a real GPU in the container suite, but it is
   not a path the compositor itself exercises.
+- **`sharestop` grace gaps.** Refusal is per *client*: a newly started capture client (a fresh
+  wf-recorder process, a new portal connection) is not refused. ext-image-copy-capture *cursor*
+  sessions (cursor image only) are neither stopped nor refused. A share the user starts through the
+  portal within the grace window fails until the window ends. A copy that was already in flight (a
+  dmabuf blit waiting on its fence) at `sharestop` still completes.
+- **Leftover sessions.** The compositor keeps a wlr-screencopy / toplevel-export session after its
+  client disconnects; it stays in `sessions` (`clientAlive: false`) until `sharestop` or its
+  monitor/window goes away. A session that was already orphaned when the plugin loaded, and whose
+  address a live client now reuses, is attributed to that client.
 - **Screencast indicators may flicker or lie.** Each (client, window) is its own compositor
   screenshare session: on a swap the target's session starts (`screencast>>1,…` IPC event) and
   the picked window's session stops ~500 ms later (`screencast>>0,…`). Anything counting those
-  events may show "not sharing" while a redirected share is live. Not verified with a real bar.
+  events may show "not sharing" while a redirected share is live. A bar should use `sharestatus`
+  (`.anyShare`) and the `hyprshare>>changed` event instead (see "For a status bar").
 - **Only buffer negotiation and copies were tested**, against a probe — not against real XDPH,
   PipeWire or any consuming app (that is what the spike is for).
 - XDPH restore tokens still name the picked window.
 - The tag is a plain static tag: tagging a window `screenshared` by hand gets undone by the plugin.
-- The hook targets a private, non-API compositor function; the plugin is pinned to one exact commit.
+- The hooks target private, non-API compositor functions (`CToplevelExportClient::captureToplevel`,
+  `Screenshare::CScreenshareFrame::share`) and it reads private screenshare state; the plugin is
+  pinned to one exact commit.

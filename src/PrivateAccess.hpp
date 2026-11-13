@@ -23,3 +23,12 @@ struct SPrivateMember {
         return MEMBER;
     }
 };
+
+// Shorthand for the above: declares TAG and instantiates it for CLASS::MEMBER of type TYPE (use an
+// alias for a TYPE containing commas). `obj->*privateMember(TAG{})` then reads/writes the member.
+#define HYPRSHARE_PRIVATE_MEMBER(TAG, CLASS, TYPE, MEMBER)                                                                                                                         \
+    struct TAG {                                                                                                                                                                   \
+        using type = TYPE CLASS::*;                                                                                                                                                \
+        friend type       privateMember(TAG);                                                                                                                                      \
+    };                                                                                                                                                                             \
+    template struct SPrivateMember<TAG, &CLASS::MEMBER>

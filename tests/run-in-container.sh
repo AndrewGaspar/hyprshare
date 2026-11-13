@@ -39,7 +39,7 @@ podman run --rm --name "$NAME" \
     -v "$HOSTLIBS":/opt/hostlibs:ro \
     -v "$ROOT":/hyprshare:ro \
     -v "$LOGS":/logs \
-    -e GPU="$GPU" -e HYPRSHARE_SUITES="${HYPRSHARE_SUITES:-share glyph}" \
+    -e GPU="$GPU" -e HYPRSHARE_SUITES="${HYPRSHARE_SUITES:-share glyph bar}" \
     "$IMAGE" -c '
         set -u
         NEST=$(mktemp -d /tmp/nest.XXXXXX); chmod 0700 "$NEST"
@@ -49,12 +49,12 @@ podman run --rm --name "$NAME" \
         for _ in $(seq 100); do [[ -S "$NEST/wayland-0" ]] && break; sleep 0.1; done
         [[ -S "$NEST/wayland-0" ]] || { echo "labwc did not come up"; cat /logs/labwc.out; exit 1; }
         RC=0
-        for SUITE in ${HYPRSHARE_SUITES:-share glyph}; do
+        for SUITE in ${HYPRSHARE_SUITES:-share glyph bar}; do
             mkdir -p "/logs/$SUITE"
             echo "=== suite: $SUITE"
             SUITE="$SUITE" NEST_WAYLAND="$NEST/wayland-0" HYPRLAND_BIN=/opt/hypxrland/Hyprland HYPRCTL_BIN=/opt/hypxrland/hyprctl \
                 HYPRLAND_LIBRARY_PATH=/opt/hostlibs TERM_BIN=/usr/bin/kitty LOG_EXPORT_DIR="/logs/$SUITE" DRM_NODE="$GPU" \
-                /hyprshare/tests/run-isolated.sh /hyprshare/build/hyprshare-v4.so || RC=1
+                /hyprshare/tests/run-isolated.sh /hyprshare/build/hyprshare-v5.so || RC=1
         done
         kill "$LABWC" 2>/dev/null
         exit $RC

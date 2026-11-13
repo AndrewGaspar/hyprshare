@@ -56,6 +56,7 @@ namespace HyprShare {
             ACT_SERVE,       // let the original run with `window`
             ACT_PLACEHOLDER, // create the frame ourselves and serve a black placeholder
             ACT_FAIL,        // create the frame ourselves and send `failed` (untracked / unknown null)
+            ACT_FAIL_LATER,  // same, but answer `failed` after a short delay (refused after sharestop)
         };
 
         struct SServeDecision {
@@ -71,8 +72,10 @@ namespace HyprShare {
         // Called from the hook INSTEAD of the original, for ACT_PLACEHOLDER / ACT_FAIL. Creates the
         // frame resource ourselves (so the id is never a NULL object) and either serves a placeholder
         // or sends `failed`.
-        void            placeholderFrame(wl_client* client, uint32_t version, uint32_t frameID, uint64_t captureID);
-        void            failFrame(wl_client* client, uint32_t version, uint32_t frameID);
+        void placeholderFrame(wl_client* client, uint32_t version, uint32_t frameID, uint64_t captureID);
+        // `delayed`: answer after PLACEHOLDER_THROTTLE instead of at once, so a client that re-requests
+        // on `failed` (patched XDPH) is not spun in a tight loop during the sharestop grace window.
+        void            failFrame(wl_client* client, uint32_t version, uint32_t frameID, bool delayed = false);
 
         SDispatchResult shareWindow(const std::string& selector);
         SDispatchResult shareWindowTarget(const PHLWINDOW& target); // also resumes a pause
@@ -80,7 +83,21 @@ namespace HyprShare {
         // Every active capture goes to the sticky NOTHING placeholder state (same as a closed window);
         // the window it was serving is remembered as the paused window.
         SDispatchResult pause();
-        std::string     statusJSON() const;
+        // sharefocus: focus the window the current window share serves (see sharedWindow()).
+        SDispatchResult focusShared();
+        // sharestop: forget every capture, target, pause and NOTHING state, answer pending placeholders,
+        // untag. Returns the clients whose captures were forgotten (identity only).
+        std::vector<wl_client*> forgetAll();
+        std::string             statusJSON() const;
+        std::string             fingerprint() const; // bar-relevant state, for `hyprshare>>changed`
+
+        // The window share a bar should show: the active capture most recently started or retargeted
+        // (sharewindow retargets every active capture at once, so they agree after one).
+        struct SSharedWindow {
+            const char* state = nullptr; // null: no active window share; else "live", "paused" or "closed"
+            PHLWINDOW   window;          // the served window (live) / the window a resume returns to (paused); null if gone
+        };
+        SSharedWindow sharedWindow() const;
 
         // For the glyphs: is any share active at all, and what should `window`'s glyph show?
         bool        shareModeActive() const;
@@ -108,6 +125,7 @@ namespace HyprShare {
             bool            pausedByUser = false; // the NOTHING came from pause(), not a closed window
 
             Time::steady_tp lastSeen;
+            Time::steady_tp lastRetarget;          // capture started, or sharewindow / shareclear touched it
             uint32_t        outstandingFrames = 0; // frame objects alive (real or placeholder)
 
             // Constraints of the last REAL frame, reused for the placeholder so nothing renegotiates.
@@ -140,9 +158,10 @@ namespace HyprShare {
             Vector2D                           size;
             uint32_t                           format = 0;
             PHLMONITORREF                      monitor;
-            bool                               answered  = false; // ready/failed already sent for this frame
-            bool                               copyAsked = false;
-            SP<IHLBuffer>                      copyBuffer; // set while a throttled copy is pending
+            bool                               answered    = false; // ready/failed already sent for this frame
+            bool                               copyAsked   = false;
+            bool                               failPending = false; // a delayed `failed` is scheduled (copyTimer)
+            SP<IHLBuffer>                      copyBuffer;          // set while a throttled copy is pending
             Time::steady_tp                    timestamp;
             SP<CEventLoopTimer>                copyTimer;
             CShareRedirector*                  owner = nullptr;
@@ -182,6 +201,7 @@ namespace HyprShare {
         bool        renderPlaceholder(const SP<IHLBuffer>& buffer, const Vector2D& size, PHLMONITOR monitor);
         void        finishPlaceholders(uint64_t captureID); // answer+drop this capture's pending frames
         void        dropPlaceholder(CHyprlandToplevelExportFrameV1* resource);
+        void        answerFailed(SPlaceholderFrame* frame); // send `failed` once, cancelling its timer
 
         void        armTimer();
         void        onTick();

@@ -1,4 +1,6 @@
 #include "ShareRedirector.hpp"
+#include "CaptureSessions.hpp"
+#include "ChangeEvent.hpp"
 
 #include <src/Compositor.hpp>
 #include <src/config/shared/actions/ConfigActions.hpp>
@@ -121,7 +123,7 @@ CShareRedirector::~CShareRedirector() {
             ph->copyTimer->cancel();
             g_pEventLoopManager->removeTimer(ph->copyTimer);
         }
-        if (ph->copyAsked && !ph->answered && ph->resource && ph->resource->resource())
+        if ((ph->copyAsked || ph->failPending) && !ph->answered && ph->resource && ph->resource->resource())
             ph->resource->sendFailed();
         if (ph->resource && ph->resource->resource())
             wl_resource_set_user_data(ph->resource->resource(), nullptr);
@@ -232,6 +234,11 @@ size_t CShareRedirector::placeholderCount(uint64_t captureID) const {
 }
 
 CShareRedirector::SServeDecision CShareRedirector::onCaptureRequest(wl_client* client, PHLWINDOW requested) {
+    // Right after sharestop the clients it stopped are refused for a grace window, so a portal's
+    // immediate retry cannot restart the share. No capture record is created for them.
+    if (captureSessions() && captureSessions()->refused(client))
+        return {.action = ACT_FAIL_LATER};
+
     const auto NOW     = Time::steadyNow();
     auto*      capture = findCapture(client, requested);
 
@@ -248,12 +255,13 @@ CShareRedirector::SServeDecision CShareRedirector::onCaptureRequest(wl_client* c
         watchClient(client);
 
         capture = &m_captures.emplace_back(SCapture{
-            .id         = m_nextCaptureID++,
-            .client     = client,
-            .pid        = pid,
-            .origin     = requested,
-            .originAddr = addressOf(requested),
-            .lastSeen   = NOW,
+            .id           = m_nextCaptureID++,
+            .client       = client,
+            .pid          = pid,
+            .origin       = requested,
+            .originAddr   = addressOf(requested),
+            .lastSeen     = NOW,
+            .lastRetarget = NOW,
         });
     }
 
@@ -385,8 +393,9 @@ void CShareRedirector::placeholderFrame(wl_client* client, uint32_t version, uin
     resource->sendBufferDone();
 }
 
-void CShareRedirector::failFrame(wl_client* client, uint32_t version, uint32_t frameID) {
-    // Create the resource for the new_id (so libwayland never leaves it NULL) and immediately fail it.
+void CShareRedirector::failFrame(wl_client* client, uint32_t version, uint32_t frameID, bool delayed) {
+    // Create the resource for the new_id (so libwayland never leaves it NULL) and fail it — at once,
+    // or (delayed) from a timer. Either way the client destroys it itself; we never do.
     auto resource = makeShared<CHyprlandToplevelExportFrameV1>(client, version, frameID);
     if (!resource->resource()) {
         wl_client_post_no_memory(client);
@@ -396,14 +405,41 @@ void CShareRedirector::failFrame(wl_client* client, uint32_t version, uint32_t f
     auto& ph      = m_placeholders.emplace_back(makeUnique<SPlaceholderFrame>());
     ph->resource  = resource;
     ph->captureID = 0;
-    ph->answered  = true;
+    ph->answered  = !delayed;
     ph->owner     = this;
 
+    auto* const RAW = ph.get();
     resource->setDestroy([this](CHyprlandToplevelExportFrameV1* r) { dropPlaceholder(r); });
     resource->setOnDestroy([this](CHyprlandToplevelExportFrameV1* r) { dropPlaceholder(r); });
-    resource->setCopy([](CHyprlandToplevelExportFrameV1* r, wl_resource*, int32_t) { r->sendFailed(); });
+    resource->setCopy([this, RAW](CHyprlandToplevelExportFrameV1* r, wl_resource*, int32_t) {
+        // No buffer was ever offered, so a copy is a client error; answer it like any failed frame.
+        if (RAW->answered)
+            return;
+        answerFailed(RAW);
+    });
 
-    resource->sendFailed();
+    if (!delayed) {
+        resource->sendFailed();
+        return;
+    }
+
+    RAW->failPending = true;
+    RAW->copyTimer   = makeShared<CEventLoopTimer>(PLACEHOLDER_THROTTLE, [this, RAW](SP<CEventLoopTimer>, void*) { answerFailed(RAW); }, nullptr);
+    g_pEventLoopManager->addTimer(RAW->copyTimer);
+}
+
+void CShareRedirector::answerFailed(SPlaceholderFrame* frame) {
+    if (frame->copyTimer) {
+        frame->copyTimer->cancel();
+        g_pEventLoopManager->removeTimer(frame->copyTimer);
+        frame->copyTimer.reset();
+    }
+    frame->failPending = false;
+    if (frame->answered)
+        return;
+    frame->answered = true;
+    if (frame->resource && frame->resource->resource())
+        frame->resource->sendFailed();
 }
 
 void CShareRedirector::doPlaceholderCopy(SPlaceholderFrame* frame) {
@@ -571,6 +607,7 @@ void CShareRedirector::updateTags() {
 
     syncModeTags(false);
     refreshGlyphs();
+    notifyChanged();
 }
 
 bool CShareRedirector::shareModeActive() const {
@@ -682,6 +719,7 @@ SDispatchResult CShareRedirector::shareWindowTarget(const PHLWINDOW& TARGET) {
         c.mode         = SCapture::FOLLOW_TARGET;
         c.nothing      = false;
         c.pausedByUser = false;
+        c.lastRetarget = NOW;
         affected++;
     }
 
@@ -699,10 +737,12 @@ SDispatchResult CShareRedirector::shareWindowTarget(const PHLWINDOW& TARGET) {
 SDispatchResult CShareRedirector::clear() {
     // Back to each portal's own pick (the user's mental model of "clear"). A capture whose pick is
     // gone simply re-enters NOTHING on its next request.
+    const auto NOW = Time::steadyNow();
     for (auto& c : m_captures) {
         c.mode         = SCapture::FOLLOW_ORIGIN;
         c.nothing      = false;
         c.pausedByUser = false;
+        c.lastRetarget = NOW;
     }
     m_target.reset();
     m_paused.reset();
@@ -746,6 +786,96 @@ SDispatchResult CShareRedirector::pause() {
     return {};
 }
 
+CShareRedirector::SSharedWindow CShareRedirector::sharedWindow() const {
+    const auto      NOW  = Time::steadyNow();
+    const SCapture* best = nullptr;
+    for (const auto& c : m_captures) {
+        if (!isActive(c, NOW))
+            continue;
+        if (!best || c.lastRetarget > best->lastRetarget)
+            best = &c;
+    }
+
+    if (!best)
+        return {};
+
+    const auto MAPPED = [](PHLWINDOW w) { return w && w->m_isMapped ? w : nullptr; };
+    if (!best->nothing) {
+        // `served` is what the last request was answered with; a capture that has not been asked since
+        // a retarget still resolves to what its next request will get.
+        PHLWINDOW w = best->served.lock();
+        if (!w)
+            w = best->mode == SCapture::FOLLOW_TARGET ? validTarget() : best->origin.lock();
+        w = MAPPED(w);
+        return {.state = w ? "live" : "closed", .window = w};
+    }
+
+    if (best->pausedByUser)
+        return {.state = "paused", .window = MAPPED(m_paused.lock())};
+
+    return {.state = "closed"};
+}
+
+SDispatchResult CShareRedirector::focusShared() {
+    const auto SHARED = sharedWindow();
+    if (!SHARED.state)
+        return {.success = false, .error = "no window share"};
+    if (!SHARED.window)
+        return {.success = false, .error = "shared window is gone"};
+
+    // Exactly the focuswindow dispatcher: switches to the window's workspace (or shows its special
+    // workspace) unless it is already visible, focuses it, and warps the cursor as that would.
+    const auto RES = Config::Actions::focus(SHARED.window);
+    if (!RES)
+        return {.success = false, .error = std::format("sharefocus: {}", RES.error().message)};
+    return {};
+}
+
+std::vector<wl_client*> CShareRedirector::forgetAll() {
+    std::vector<wl_client*> clients;
+    for (const auto& c : m_captures) {
+        if (!std::ranges::contains(clients, c.client))
+            clients.emplace_back(c.client);
+        finishPlaceholders(c.id); // a pending placeholder is answered `failed` now, never left hanging
+    }
+
+    // Frame watches and placeholders keep their capture IDs; with no capture behind them they only
+    // wait for the client to destroy them.
+    m_captures.clear();
+    m_target.reset();
+    m_paused.reset();
+    updateTags(); // nobody is served: removes `screenshared`, `screenshare-mode`, damages glyphs
+    armTimer();
+
+    Log::logger->log(Log::DEBUG, "[hyprshare] forgot every capture ({} client(s))", clients.size());
+    return clients;
+}
+
+std::string CShareRedirector::fingerprint() const {
+    const auto  NOW = Time::steadyNow();
+    std::string fp  = std::format("m{}|t{:x}{}|p{:x}", shareModeActive(), rc<uintptr_t>(m_target.get()), validTarget() ? "+" : "-", rc<uintptr_t>(m_paused.get()));
+    for (const auto& c : m_captures) {
+        fp += std::format("|c{}:{}{}{}{}:{:x}", c.id, isActive(c, NOW), sc<int>(c.mode), c.nothing, c.pausedByUser, rc<uintptr_t>(c.served.get()));
+    }
+
+    const auto SHARED = sharedWindow();
+    if (SHARED.state) {
+        fp += std::format("|s{}:{:x}", SHARED.state, rc<uintptr_t>(SHARED.window.get()));
+        if (SHARED.window)
+            fp += std::format(":{}:{}", SHARED.window->m_class, SHARED.window->m_title);
+    }
+    return fp;
+}
+
+static std::string sharedWindowJSON(const CShareRedirector::SSharedWindow& shared) {
+    if (!shared.state)
+        return "null";
+
+    const auto& W = shared.window;
+    return std::format(R"({{"state": "{}", "address": "{}", "alive": {}, "class": "{}", "title": "{}", "workspace": "{}"}})", shared.state, W ? addressString(addressOf(W)) : "",
+                       !!W, W ? jsonEscape(W->m_class) : "", W ? jsonEscape(W->m_title) : "", W && W->m_workspace ? jsonEscape(W->m_workspace->m_name) : "");
+}
+
 std::string CShareRedirector::statusJSON() const {
     const auto  NOW = Time::steadyNow();
 
@@ -762,10 +892,15 @@ std::string CShareRedirector::statusJSON() const {
             c.pid, isActive(c, NOW), STATE, REASON, AGO, c.outstandingFrames, placeholderCount(c.id), windowJSON(c.origin, c.originAddr), windowJSON(c.served, 0));
     }
 
-    const auto TARGET = m_target.lock();
-    const auto PAUSED = m_paused.lock();
-    return std::format("{{\n  \"shareMode\": {},\n  \"target\": {},\n  \"paused\": {},\n  \"captures\": [\n{}\n  ],\n  \"glyph\": {}\n}}\n", shareModeActive(),
-                       TARGET ? windowJSON(m_target, 0) : "null", PAUSED ? windowJSON(m_paused, 0) : "null", captures, glyphs() ? glyphs()->statusJSON() : "null");
+    const auto  TARGET    = m_target.lock();
+    const auto  PAUSED    = m_paused.lock();
+    const auto& SESSIONS  = captureSessions();
+    const bool  CAPTURING = SESSIONS && SESSIONS->capturing();
+    return std::format("{{\n  \"shareMode\": {},\n  \"capturing\": {},\n  \"anyShare\": {},\n  \"sharedWindow\": {},\n  \"target\": {},\n  \"paused\": {},\n"
+                       "  \"captures\": [\n{}\n  ],\n  \"sessions\": {},\n  \"stopGrace\": {},\n  \"glyph\": {}\n}}\n",
+                       shareModeActive(), CAPTURING, CAPTURING || shareModeActive(), sharedWindowJSON(sharedWindow()), TARGET ? windowJSON(m_target, 0) : "null",
+                       PAUSED ? windowJSON(m_paused, 0) : "null", captures, SESSIONS ? SESSIONS->sessionsJSON() : "[]", SESSIONS ? SESSIONS->stopGraceJSON() : "null",
+                       glyphs() ? glyphs()->statusJSON() : "null");
 }
 
 UP<CShareRedirector>& HyprShare::redirector() {
